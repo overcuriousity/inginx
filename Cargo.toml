@@ -2,24 +2,26 @@
 name = "inginx"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Single-binary OpenAI-compatible inference proxy with API key GUI, usage metering, and full request logging"
+repository = "https://github.com/overcuriousity/inginx"
 
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["stream", "json", "multipart"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.13", features = ["stream", "json", "multipart"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 maud = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 ulid = "1"
-sha2 = "0.10"
-rand = "0.8"
+sha2 = "0.11"
+rand = "0.9"
 zstd = "0.13"
 argon2 = { version = "0.5", features = ["std"] }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
-tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"

@@ -87,6 +87,11 @@ admin session required) produces:
 - The admin GUI uses vendored htmx + uPlot; the Qwen3 tokenizer is embedded
   in the binary. `cargo build` needs no network beyond crates.io.
 
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
+[MIT License](LICENSE-MIT), at your option.
+
 ## systemd
 
 See `examples/inginx.service`:

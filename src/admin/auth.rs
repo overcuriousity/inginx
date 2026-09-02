@@ -23,7 +23,7 @@ const SESSION_TTL: i64 = 7 * 24 * 3600;
 
 fn random_token() -> String {
     let mut b = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     hex::encode(b)
 }
 

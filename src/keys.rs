@@ -13,9 +13,9 @@ pub struct ApiKey {
 const BASE62: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 fn random_key() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let body: String = (0..40)
-        .map(|_| BASE62[rng.gen_range(0..BASE62.len())] as char)
+        .map(|_| BASE62[rng.random_range(0..BASE62.len())] as char)
         .collect();
     format!("igx_{body}")
 }
