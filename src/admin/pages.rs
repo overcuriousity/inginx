@@ -6,7 +6,7 @@ use axum::{
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{html, Markup, DOCTYPE};
 
 pub fn layout(title: &str, active: &str, body: Markup) -> Markup {
     let nav = [
