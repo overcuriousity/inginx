@@ -19,7 +19,7 @@ rand = "0.8"
 zstd = "0.13"
 argon2 = { version = "0.5", features = ["std"] }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
