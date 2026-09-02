@@ -90,9 +90,74 @@ pub fn prepare_upstream_body(body: &[u8], upstream_model: Option<&str>) -> (Vec<
     }
 }
 
+static TOKENIZER: std::sync::OnceLock<Option<tokenizers::Tokenizer>> = std::sync::OnceLock::new();
+
+fn tokenizer() -> Option<&'static tokenizers::Tokenizer> {
+    TOKENIZER
+        .get_or_init(|| {
+            let compressed = include_bytes!("../assets/qwen3-tokenizer.json.zst");
+            let json = zstd::decode_all(&compressed[..]).ok()?;
+            match tokenizers::Tokenizer::from_bytes(&json) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!("failed to load fallback tokenizer: {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Token count of `text` using the bundled Qwen3 tokenizer; `len/4` if the
+/// tokenizer is unavailable.
+pub fn estimate_tokens(text: &str) -> u32 {
+    match tokenizer().and_then(|t| t.encode(text, false).ok()) {
+        Some(enc) => enc.len() as u32,
+        None => (text.len() / 4).max(1) as u32,
+    }
+}
+
+/// Estimates tokens for an arbitrary body: JSON → tokens of all string leaves;
+/// other UTF-8 → tokens of the text; binary → len/4.
+pub fn estimate_body_tokens(body: &[u8]) -> u32 {
+    if body.is_empty() {
+        return 0;
+    }
+    if let Ok(v) = serde_json::from_slice::<Value>(body) {
+        let mut text = String::new();
+        collect_strings(&v, &mut text);
+        return estimate_tokens(&text);
+    }
+    match std::str::from_utf8(body) {
+        Ok(s) => estimate_tokens(s),
+        Err(_) => (body.len() / 4).max(1) as u32,
+    }
+}
+
+fn collect_strings(v: &Value, out: &mut String) {
+    match v {
+        Value::String(s) => {
+            out.push_str(s);
+            out.push('\n');
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_strings(x, out)),
+        Value::Object(o) => o.values().for_each(|x| collect_strings(x, out)),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimates_are_sane() {
+        let n = estimate_tokens("The quick brown fox jumps over the lazy dog.");
+        assert!((8..=14).contains(&n), "got {n}");
+        assert!(estimate_body_tokens(&[0u8, 159, 146, 150]) >= 1); // binary fallback
+        let j = estimate_body_tokens(br#"{"messages":[{"role":"user","content":"hello world"}]}"#);
+        assert!(j >= 2, "got {j}");
+    }
 
     #[test]
     fn usage_from_chat_json() {
