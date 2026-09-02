@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod keys;
 
 use anyhow::Result;
 
