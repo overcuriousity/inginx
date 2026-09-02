@@ -338,12 +338,235 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// WebAuthn (FIDO2) second factor
+// ---------------------------------------------------------------------------
+
+use webauthn_rs::prelude::*;
+
+/// Stable user handle for the single admin account.
+fn admin_uuid() -> Uuid {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(b"inginx-admin");
+    Uuid::from_slice(&d[..16]).expect("16 bytes")
+}
+
+/// Builds a Webauthn instance from stored rp settings, deriving and
+/// persisting them from the request Host on first use.
+async fn webauthn_for(db: &Db, headers: &HeaderMap) -> Result<Webauthn> {
+    let rp_id = match get_setting(db, "rp_id").await? {
+        Some(v) => v,
+        None => {
+            let host = headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("localhost");
+            let rp = host.split(':').next().unwrap_or("localhost").to_string();
+            set_setting(db, "rp_id", &rp).await?;
+            rp
+        }
+    };
+    let rp_origin = match get_setting(db, "rp_origin").await? {
+        Some(v) => v,
+        None => {
+            let proto = headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("http");
+            let host = headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("localhost");
+            let origin = format!("{proto}://{host}");
+            set_setting(db, "rp_origin", &origin).await?;
+            origin
+        }
+    };
+    let url = Url::parse(&rp_origin)?;
+    Ok(WebauthnBuilder::new(&rp_id, &url)?
+        .rp_name("inginx")
+        .build()?)
+}
+
+async fn stored_passkeys(db: &Db) -> Result<Vec<Passkey>> {
+    let rows: Vec<String> = db
+        .call(|c| {
+            let mut stmt = c.prepare("SELECT cred_json FROM webauthn_credentials")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|j| serde_json::from_str(j).ok())
+        .collect())
+}
+
+async fn register_start(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    // full session enforced by middleware wrapper in router()
+    let result: Result<_> = async {
+        let webauthn = webauthn_for(&st.db, &headers).await?;
+        let exclude: Vec<CredentialID> = stored_passkeys(&st.db)
+            .await?
+            .iter()
+            .map(|p| p.cred_id().clone())
+            .collect();
+        let (ccr, reg_state) = webauthn.start_passkey_registration(
+            admin_uuid(),
+            "admin",
+            "inginx admin",
+            (!exclude.is_empty()).then_some(exclude),
+        )?;
+        set_setting(&st.db, "webauthn_reg_state", &serde_json::to_string(&reg_state)?).await?;
+        Ok(axum::Json(ccr))
+    }
+    .await;
+    match result {
+        Ok(json) => json.into_response(),
+        Err(e) => {
+            tracing::error!("webauthn register start failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "webauthn error").into_response()
+        }
+    }
+}
+
+async fn register_finish(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let result: Result<()> = async {
+        let webauthn = webauthn_for(&st.db, &headers).await?;
+        let reg: RegisterPublicKeyCredential = serde_json::from_slice(&body)?;
+        let state_json = get_setting(&st.db, "webauthn_reg_state")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no registration in progress"))?;
+        let reg_state: PasskeyRegistration = serde_json::from_str(&state_json)?;
+        let passkey = webauthn.finish_passkey_registration(&reg, &reg_state)?;
+        let json = serde_json::to_string(&passkey)?;
+        st.db
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO webauthn_credentials (cred_json, created_at) VALUES (?1, ?2)",
+                    rusqlite::params![json, now()],
+                )?;
+                c.execute("DELETE FROM settings WHERE key = 'webauthn_reg_state'", [])?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => axum::Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => {
+            tracing::warn!("webauthn register finish rejected: {e}");
+            (StatusCode::BAD_REQUEST, "registration rejected").into_response()
+        }
+    }
+}
+
+async fn auth_start(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if session_state(&st.db, &headers).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, "no session").into_response();
+    }
+    let result: Result<_> = async {
+        let webauthn = webauthn_for(&st.db, &headers).await?;
+        let passkeys = stored_passkeys(&st.db).await?;
+        if passkeys.is_empty() {
+            anyhow::bail!("no passkeys enrolled");
+        }
+        let (rcr, auth_state) = webauthn.start_passkey_authentication(&passkeys)?;
+        set_setting(&st.db, "webauthn_auth_state", &serde_json::to_string(&auth_state)?).await?;
+        Ok(axum::Json(rcr))
+    }
+    .await;
+    match result {
+        Ok(json) => json.into_response(),
+        Err(e) => {
+            tracing::error!("webauthn auth start failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "webauthn error").into_response()
+        }
+    }
+}
+
+async fn auth_finish(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some((token, _)) = session_state(&st.db, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, "no session").into_response();
+    };
+    let result: Result<()> = async {
+        let webauthn = webauthn_for(&st.db, &headers).await?;
+        let cred: PublicKeyCredential = serde_json::from_slice(&body)?;
+        let state_json = get_setting(&st.db, "webauthn_auth_state")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no authentication in progress"))?;
+        let auth_state: PasskeyAuthentication = serde_json::from_str(&state_json)?;
+        webauthn.finish_passkey_authentication(&cred, &auth_state)?;
+        st.db
+            .call(move |c| {
+                c.execute("UPDATE sessions SET full = 1 WHERE token = ?1", [token])?;
+                c.execute("DELETE FROM settings WHERE key = 'webauthn_auth_state'", [])?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => axum::Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => {
+            tracing::warn!("webauthn auth finish rejected: {e}");
+            (StatusCode::UNAUTHORIZED, "authentication rejected").into_response()
+        }
+    }
+}
+
+async fn twofa_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if session_state(&st.db, &headers).await.is_none() {
+        return Redirect::to("/admin/login").into_response();
+    }
+    page(
+        "Two-factor authentication",
+        html! {
+            p { "Confirm your identity with your passkey." }
+            button id="go" { "Use passkey" }
+            p class="err" id="err" {}
+            script { (maud::PreEscaped(include_str!("../../assets/webauthn.js"))) }
+            script {
+                (maud::PreEscaped(r#"
+                document.getElementById('go').addEventListener('click', async () => {
+                    try {
+                        await window.inginxAuthenticatePasskey();
+                        location.href = '/admin';
+                    } catch (e) {
+                        document.getElementById('err').textContent = e.message;
+                    }
+                });
+                "#))
+            }
+        },
+    )
+    .into_response()
+}
+
 pub fn router(state: AppState) -> Router {
+    let register = Router::new()
+        .route("/admin/webauthn/register/start", post(register_start))
+        .route("/admin/webauthn/register/finish", post(register_finish))
+        .with_state(state.clone());
     Router::new()
         .route("/admin/setup", get(setup_form).post(setup_submit))
         .route("/admin/login", get(login_form).post(login_submit))
+        .route("/admin/login/2fa", get(twofa_page))
         .route("/admin/logout", post(logout))
-        .with_state(state)
+        .route("/admin/webauthn/auth/start", post(auth_start))
+        .route("/admin/webauthn/auth/finish", post(auth_finish))
+        .with_state(state.clone())
+        .merge(protect(state, register))
 }
 
 /// Wraps a router of protected admin pages with the session middleware.
@@ -457,5 +680,83 @@ mod tests {
         let r = req(&app, "GET", "/admin/keys", None, None).await;
         assert_eq!(r.status(), StatusCode::SEE_OTHER);
         assert_eq!(r.headers().get(header::LOCATION).unwrap(), "/admin/login");
+    }
+
+    async fn setup_admin(st: &AppState, app: &Router) -> String {
+        let token = ensure_setup_token(&st.db).await.unwrap().unwrap();
+        req(
+            app,
+            "POST",
+            "/admin/setup",
+            Some(&format!("t={token}&username=admin&password=longenoughpw1")),
+            None,
+        )
+        .await;
+        let r = req(
+            app,
+            "POST",
+            "/admin/login",
+            Some("username=admin&password=longenoughpw1"),
+            None,
+        )
+        .await;
+        r.headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn webauthn_register_start_returns_challenge() {
+        let st = state().await;
+        let app = full_router(st.clone());
+        let cookie = setup_admin(&st, &app).await;
+        let r = req(&app, "POST", "/admin/webauthn/register/start", None, Some(&cookie)).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["publicKey"]["challenge"].is_string());
+        assert_eq!(v["publicKey"]["rp"]["name"], "inginx");
+    }
+
+    #[tokio::test]
+    async fn webauthn_auth_finish_garbage_rejected() {
+        let st = state().await;
+        let app = full_router(st.clone());
+        let cookie = setup_admin(&st, &app).await;
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/webauthn/auth/finish")
+            .header("content-type", "application/json");
+        b = b.header("cookie", format!("{SESSION_COOKIE}={cookie}"));
+        let r = app
+            .clone()
+            .oneshot(b.body(axum::body::Body::from("{\"garbage\":true}")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        // and with no session at all
+        let r = req(&app, "POST", "/admin/webauthn/auth/finish", None, None).await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn half_session_cannot_pass_require_session() {
+        let st = state().await;
+        let app = full_router(st.clone());
+        let half = create_session(&st.db, false).await.unwrap();
+        let r = req(&app, "GET", "/admin/keys", None, Some(&half)).await;
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        let full = create_session(&st.db, true).await.unwrap();
+        let r = req(&app, "GET", "/admin/keys", None, Some(&full)).await;
+        assert_eq!(r.status(), StatusCode::OK);
     }
 }
