@@ -50,6 +50,19 @@ async fn spawn_mock_upstream() -> SocketAddr {
         .route(
             "/models",
             get(|| async { Json(serde_json::json!({"data":[{"id":"m-upstream"}]})) }),
+        )
+        .route(
+            "/audio/speech",
+            post(|| async {
+                axum::response::Response::builder()
+                    .header("content-type", "audio/wav")
+                    .body(axum::body::Body::from(&b"RIFFfakewavdata"[..]))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/echo",
+            post(|body: String| async move { format!("echoed:{body}") }),
         );
     spawn_app(app).await
 }
@@ -243,6 +256,101 @@ async fn unknown_model_404() {
     assert_eq!(resp.status(), 404);
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["error"]["code"], "model_not_found");
+}
+
+#[tokio::test]
+async fn tts_binary_response_estimated_usage() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/audio/speech", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m","input":"Hello world, please speak this.","voice":"alloy"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "audio/wav"
+    );
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(&body[..], b"RIFFfakewavdata");
+    wait_for_rows(&ctx.db, 1).await;
+    let (pt, ct, src): (i64, i64, String) = ctx
+        .db
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT prompt_tokens, completion_tokens, usage_source FROM requests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(pt > 0, "prompt tokens estimated from input text");
+    assert_eq!(ct, 0);
+    assert_eq!(src, "estimated");
+}
+
+#[tokio::test]
+async fn unknown_path_passthrough_to_default_backend() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/echo", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .body("ping")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "echoed:ping");
+    wait_for_rows(&ctx.db, 1).await;
+    let endpoint: String = ctx
+        .db
+        .call(|c| Ok(c.query_row("SELECT endpoint FROM requests", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(endpoint, "/v1/echo");
+}
+
+#[tokio::test]
+async fn unreachable_backend_502_openai_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("t.db")).unwrap();
+    std::mem::forget(dir);
+    // port from a listener we immediately drop -> nothing listens there
+    let dead_addr = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let b = registry::add_backend(&db, "dead", &format!("http://{dead_addr}"), None, true)
+        .await
+        .unwrap();
+    registry::add_model(&db, b, "dead-m", "dead-m").await.unwrap();
+    let key = keys::create(&db, "k", true, &[], None).await.unwrap();
+    let state = proxy::AppState {
+        db: db.clone(),
+        log: logstore::spawn_writer(db.clone()),
+        http: reqwest::Client::new(),
+    };
+    let inginx = spawn_app(proxy::router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{inginx}/v1/chat/completions"))
+        .bearer_auth(&key)
+        .json(&serde_json::json!({"model":"dead-m","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "upstream_unreachable");
+    wait_for_rows(&db, 1).await;
+    let err: Option<String> = db
+        .call(|c| Ok(c.query_row("SELECT error FROM requests", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert!(err.unwrap().contains("unreachable"));
 }
 
 #[tokio::test]
