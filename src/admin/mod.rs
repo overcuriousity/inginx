@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod auth;
+pub mod logs;
 pub mod pages;
 
 use crate::proxy::AppState;
@@ -19,6 +20,9 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/backends/{id}/default", post(actions::make_default_backend))
         .route("/admin/models/{id}/toggle", post(actions::toggle_model))
         .route("/admin/models/{id}/alias", post(actions::rename_model))
+        .route("/admin/logs", get(logs::logs_page))
+        .route("/admin/logs/{id}", get(logs::log_detail))
+        .route("/admin/logs/{id}/download", get(logs::log_download))
         .with_state(state.clone());
     Router::new()
         .route("/admin/assets/{file}", get(pages::assets))
@@ -194,6 +198,59 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let models = crate::registry::list_models(&st.db).await.unwrap();
         assert!(models.iter().any(|x| x.alias == "renamed"));
+    }
+
+    #[tokio::test]
+    async fn logs_page_filter_and_detail() {
+        let (st, app, cookie) = logged_in().await;
+        // seed two rows directly
+        for (model, status) in [("m1", 200u16), ("m2", 500u16)] {
+            let rec = crate::logstore::LogRecord {
+                id: ulid::Ulid::new().to_string(),
+                ts: crate::db::now(),
+                key_id: None,
+                model: Some(model.into()),
+                endpoint: "/v1/chat/completions".into(),
+                status,
+                latency_ms: 5,
+                ttfb_ms: None,
+                usage: crate::metering::Usage { prompt_tokens: 1, completion_tokens: 2 },
+                usage_source: "upstream",
+                error: None,
+                req_headers: "{}".into(),
+                resp_headers: "{}".into(),
+                req_body: br#"{"messages":[{"content":"seekable-needle"}]}"#.to_vec(),
+                resp_body: br#"{"choices":[]}"#.to_vec(),
+            };
+            st.log.send(rec);
+        }
+        for _ in 0..100 {
+            let n: i64 = st
+                .db
+                .call(|c| Ok(c.query_row("SELECT count(*) FROM requests", [], |r| r.get(0))?))
+                .await
+                .unwrap();
+            if n == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let (status, body) = get_page(&app, "/admin/logs", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("m1") && body.contains("m2"), "{body}");
+
+        let (_, body) = get_page(&app, "/admin/logs?status=5xx", &cookie).await;
+        assert!(body.contains("m2") && !body.contains(">m1<"), "{body}");
+
+        let id: String = st
+            .db
+            .call(|c| Ok(c.query_row("SELECT id FROM requests LIMIT 1", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        let (status, body) = get_page(&app, &format!("/admin/logs/{id}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("seekable-needle"), "{body}");
     }
 
     #[tokio::test]
