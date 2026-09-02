@@ -89,7 +89,11 @@ pub async fn add_backend(State(st): State<AppState>, RawForm(body): RawForm) -> 
     };
     let (name, base_url, api_key) = (get("name"), get("base_url"), get("upstream_api_key"));
     if name.is_empty() || base_url.is_empty() {
-        return (axum::http::StatusCode::BAD_REQUEST, "name and base_url are required").into_response();
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "name and base_url are required",
+        )
+            .into_response();
     }
     let is_default = fields.iter().any(|(k, _)| k == "is_default");
     let key = (!api_key.is_empty()).then_some(api_key);
@@ -105,11 +109,17 @@ pub async fn import_backend(State(st): State<AppState>, Path(id): Path<i64>) -> 
             render_backends(&st, Some("No new models found.".into())).await
         }
         Ok(added) => {
-            render_backends(&st, Some(format!("Imported {} models: {}", added.len(), added.join(", ")))).await
+            render_backends(
+                &st,
+                Some(format!(
+                    "Imported {} models: {}",
+                    added.len(),
+                    added.join(", ")
+                )),
+            )
+            .await
         }
-        Err(e) => {
-            render_backends(&st, Some(format!("Import failed: {e}"))).await
-        }
+        Err(e) => render_backends(&st, Some(format!("Import failed: {e}"))).await,
     }
 }
 
@@ -124,10 +134,12 @@ pub async fn toggle_model(State(st): State<AppState>, Path(id): Path<i64>) -> Re
     let enabled: Option<bool> = st
         .db
         .call(move |c| {
-            Ok(c.query_row("SELECT enabled FROM models WHERE id = ?1", [id], |r| {
-                Ok(r.get::<_, i64>(0)? != 0)
-            })
-            .ok())
+            Ok(
+                c.query_row("SELECT enabled FROM models WHERE id = ?1", [id], |r| {
+                    Ok(r.get::<_, i64>(0)? != 0)
+                })
+                .ok(),
+            )
         })
         .await
         .ok()

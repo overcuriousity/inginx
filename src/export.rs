@@ -238,7 +238,10 @@ mod tests {
             status: 200,
             latency_ms: 42,
             ttfb_ms: Some(7),
-            usage: Usage { prompt_tokens: 5, completion_tokens: 9 },
+            usage: Usage {
+                prompt_tokens: 5,
+                completion_tokens: 9,
+            },
             usage_source: "upstream",
             error: None,
             req_headers: "{}".into(),
@@ -267,7 +270,11 @@ mod tests {
         seed(&db, 999_999, "out-of-filter").await;
         let out = native_jsonl(
             &db,
-            &Filter { from: Some(0), to: Some(2000), ..Default::default() },
+            &Filter {
+                from: Some(0),
+                to: Some(2000),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -288,7 +295,9 @@ mod tests {
         let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
         let trace_id = span["traceId"].as_str().unwrap();
         assert_eq!(trace_id.len(), 32);
-        assert!(trace_id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(trace_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         let attrs = span["attributes"].as_array().unwrap();
         let input = attrs
             .iter()

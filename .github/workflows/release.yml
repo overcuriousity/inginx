@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: |
+          cp target/release/inginx inginx-x86_64-linux
+          sha256sum inginx-x86_64-linux > inginx-x86_64-linux.sha256
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            inginx-x86_64-linux
+            inginx-x86_64-linux.sha256
+          generate_release_notes: true

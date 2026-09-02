@@ -10,7 +10,10 @@ use axum::Router;
 
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
-        .route("/admin/keys", get(pages::keys_page).post(actions::create_key))
+        .route(
+            "/admin/keys",
+            get(pages::keys_page).post(actions::create_key),
+        )
         .route("/admin/keys/{id}/revoke", post(actions::revoke_key))
         .route("/admin/keys/{id}/rotate", post(actions::rotate_key))
         .route(
@@ -18,7 +21,10 @@ pub fn router(state: AppState) -> Router {
             get(pages::backends_page).post(actions::add_backend),
         )
         .route("/admin/backends/{id}/import", post(actions::import_backend))
-        .route("/admin/backends/{id}/default", post(actions::make_default_backend))
+        .route(
+            "/admin/backends/{id}/default",
+            post(actions::make_default_backend),
+        )
         .route("/admin/models/{id}/toggle", post(actions::toggle_model))
         .route("/admin/models/{id}/alias", post(actions::rename_model))
         .route("/admin/logs", get(logs::logs_page))
@@ -30,7 +36,10 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/settings/retention", post(dashboard::save_retention))
         .route("/admin/settings/password", post(dashboard::change_password))
         .route("/admin/settings/rp", post(dashboard::save_rp))
-        .route("/admin/settings/passkeys/{id}/delete", post(dashboard::delete_passkey))
+        .route(
+            "/admin/settings/passkeys/{id}/delete",
+            post(dashboard::delete_passkey),
+        )
         .route("/admin/export", get(dashboard::export))
         .with_state(state.clone());
     Router::new()
@@ -128,7 +137,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("Create key"), "{body}");
 
-        let (status, body) = post_form(&app, "/admin/keys", "name=test&all_models=on", &cookie).await;
+        let (status, body) =
+            post_form(&app, "/admin/keys", "name=test&all_models=on", &cookie).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("igx_"), "plaintext key shown once: {body}");
 
@@ -144,9 +154,11 @@ mod tests {
         let revoked: Option<i64> = st
             .db
             .call(move |c| {
-                Ok(c.query_row("SELECT revoked_at FROM api_keys WHERE id = ?1", [id], |r| {
-                    r.get(0)
-                })?)
+                Ok(
+                    c.query_row("SELECT revoked_at FROM api_keys WHERE id = ?1", [id], |r| {
+                        r.get(0)
+                    })?,
+                )
             })
             .await
             .unwrap();
@@ -187,12 +199,16 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("qwen3-8b") && body.contains("bge-m3"), "{body}");
+        assert!(
+            body.contains("qwen3-8b") && body.contains("bge-m3"),
+            "{body}"
+        );
 
         let models = crate::registry::list_models(&st.db).await.unwrap();
         assert_eq!(models.len(), 2);
         let m = &models[0];
-        let (status, _) = post_form(&app, &format!("/admin/models/{}/toggle", m.id), "", &cookie).await;
+        let (status, _) =
+            post_form(&app, &format!("/admin/models/{}/toggle", m.id), "", &cookie).await;
         assert_eq!(status, StatusCode::OK);
         let models = crate::registry::list_models(&st.db).await.unwrap();
         assert!(!models.iter().find(|x| x.id == m.id).unwrap().enabled);
@@ -223,7 +239,10 @@ mod tests {
                 status,
                 latency_ms: 5,
                 ttfb_ms: None,
-                usage: crate::metering::Usage { prompt_tokens: 1, completion_tokens: 2 },
+                usage: crate::metering::Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 2,
+                },
                 usage_source: "upstream",
                 error: None,
                 req_headers: "{}".into(),
@@ -287,7 +306,10 @@ mod tests {
             status: 200,
             latency_ms: 5,
             ttfb_ms: None,
-            usage: crate::metering::Usage { prompt_tokens: 1, completion_tokens: 2 },
+            usage: crate::metering::Usage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+            },
             usage_source: "upstream",
             error: None,
             req_headers: "{}".into(),
@@ -301,7 +323,9 @@ mod tests {
                 .call(|c| Ok(c.query_row("SELECT count(*) FROM requests", [], |r| r.get(0))?))
                 .await
                 .unwrap();
-            if n == 1 { break; }
+            if n == 1 {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
@@ -324,11 +348,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert_eq!(
-            crate::logstore::get_setting(&st.db, "retention_max_age_secs").await.unwrap().unwrap(),
+            crate::logstore::get_setting(&st.db, "retention_max_age_secs")
+                .await
+                .unwrap()
+                .unwrap(),
             (30i64 * 86_400).to_string()
         );
         assert_eq!(
-            crate::logstore::get_setting(&st.db, "retention_max_db_bytes").await.unwrap().unwrap(),
+            crate::logstore::get_setting(&st.db, "retention_max_db_bytes")
+                .await
+                .unwrap()
+                .unwrap(),
             "2000000000"
         );
 

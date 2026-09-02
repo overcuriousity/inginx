@@ -89,9 +89,7 @@ pub fn spawn_writer(db: Db) -> LogWriter {
     let (tx, mut rx) = mpsc::channel::<LogRecord>(1024);
     tokio::spawn(async move {
         while let Some(rec) = rx.recv().await {
-            let res = db
-                .call(move |c| insert_record(c, &rec))
-                .await;
+            let res = db.call(move |c| insert_record(c, &rec)).await;
             if let Err(e) = res {
                 tracing::error!("failed to write log record: {e}");
             }
@@ -142,7 +140,9 @@ pub async fn get_setting(db: &Db, key: &str) -> Result<Option<String>> {
     let key = key.to_string();
     db.call(move |c| {
         let v = c
-            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -232,7 +232,10 @@ mod tests {
             status: 200,
             latency_ms: 50,
             ttfb_ms: Some(10),
-            usage: Usage { prompt_tokens: 5, completion_tokens: 7 },
+            usage: Usage {
+                prompt_tokens: 5,
+                completion_tokens: 7,
+            },
             usage_source: "upstream",
             error: None,
             req_headers: "{}".into(),

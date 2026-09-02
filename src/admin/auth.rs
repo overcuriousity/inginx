@@ -2,7 +2,9 @@ use crate::db::{now, Db};
 use crate::logstore::{get_setting, set_setting};
 use crate::proxy::AppState;
 use anyhow::Result;
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
 use axum::{
     extract::{Query, State},
@@ -55,7 +57,11 @@ pub fn hash_password(password: &str) -> Result<String> {
 
 pub fn verify_password(password: &str, hash: &str) -> bool {
     PasswordHash::new(hash)
-        .map(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
+        .map(|h| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &h)
+                .is_ok()
+        })
         .unwrap_or(false)
 }
 
@@ -200,7 +206,11 @@ async fn setup_submit(State(st): State<AppState>, Form(f): Form<SetupForm>) -> R
         _ => return (StatusCode::FORBIDDEN, "invalid or used setup token").into_response(),
     }
     if f.password.len() < 12 {
-        return (StatusCode::BAD_REQUEST, "password must be at least 12 characters").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "password must be at least 12 characters",
+        )
+            .into_response();
     }
     let hash = match hash_password(&f.password) {
         Ok(h) => h,
@@ -295,7 +305,9 @@ async fn login_submit(State(st): State<AppState>, Form(f): Form<LoginForm>) -> R
     let has_passkeys: bool = st
         .db
         .call(|c| {
-            let n: i64 = c.query_row("SELECT count(*) FROM webauthn_credentials", [], |r| r.get(0))?;
+            let n: i64 = c.query_row("SELECT count(*) FROM webauthn_credentials", [], |r| {
+                r.get(0)
+            })?;
             Ok(n > 0)
         })
         .await
@@ -417,7 +429,12 @@ async fn register_start(State(st): State<AppState>, headers: HeaderMap) -> Respo
             "inginx admin",
             (!exclude.is_empty()).then_some(exclude),
         )?;
-        set_setting(&st.db, "webauthn_reg_state", &serde_json::to_string(&reg_state)?).await?;
+        set_setting(
+            &st.db,
+            "webauthn_reg_state",
+            &serde_json::to_string(&reg_state)?,
+        )
+        .await?;
         Ok(axum::Json(ccr))
     }
     .await;
@@ -477,7 +494,12 @@ async fn auth_start(State(st): State<AppState>, headers: HeaderMap) -> Response 
             anyhow::bail!("no passkeys enrolled");
         }
         let (rcr, auth_state) = webauthn.start_passkey_authentication(&passkeys)?;
-        set_setting(&st.db, "webauthn_auth_state", &serde_json::to_string(&auth_state)?).await?;
+        set_setting(
+            &st.db,
+            "webauthn_auth_state",
+            &serde_json::to_string(&auth_state)?,
+        )
+        .await?;
         Ok(axum::Json(rcr))
     }
     .await;
@@ -646,7 +668,14 @@ mod tests {
         assert!(ensure_setup_token(&st.db).await.unwrap().is_none());
 
         // bad password -> 200 with error page, no cookie
-        let r = req(&app, "POST", "/admin/login", Some("username=admin&password=nope"), None).await;
+        let r = req(
+            &app,
+            "POST",
+            "/admin/login",
+            Some("username=admin&password=nope"),
+            None,
+        )
+        .await;
         assert!(r.headers().get(header::SET_COOKIE).is_none());
 
         // good login -> cookie + redirect to /admin (no passkeys yet)
@@ -719,7 +748,14 @@ mod tests {
         let st = state().await;
         let app = full_router(st.clone());
         let cookie = setup_admin(&st, &app).await;
-        let r = req(&app, "POST", "/admin/webauthn/register/start", None, Some(&cookie)).await;
+        let r = req(
+            &app,
+            "POST",
+            "/admin/webauthn/register/start",
+            None,
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
         let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -739,7 +775,10 @@ mod tests {
         b = b.header("cookie", format!("{SESSION_COOKIE}={cookie}"));
         let r = app
             .clone()
-            .oneshot(b.body(axum::body::Body::from("{\"garbage\":true}")).unwrap())
+            .oneshot(
+                b.body(axum::body::Body::from("{\"garbage\":true}"))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);

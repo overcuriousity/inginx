@@ -111,7 +111,9 @@ pub async fn dashboard(State(st): State<AppState>) -> Response {
     );
     let top_models = top_rows(&st.db, "model", 7).await.unwrap_or_default();
     let top_keys = top_rows(&st.db, "key", 7).await.unwrap_or_default();
-    let backends = crate::registry::list_backends(&st.db).await.unwrap_or_default();
+    let backends = crate::registry::list_backends(&st.db)
+        .await
+        .unwrap_or_default();
     let mut health = Vec::new();
     for b in &backends {
         health.push(backend_up(&st.http, b).await);
@@ -206,8 +208,16 @@ pub async fn settings_page(State(st): State<AppState>) -> Response {
         .and_then(|v| v.parse::<f64>().ok())
         .map(|b| b / 1e9);
     let (rp_id, rp_origin) = (
-        get_setting(&st.db, "rp_id").await.ok().flatten().unwrap_or_default(),
-        get_setting(&st.db, "rp_origin").await.ok().flatten().unwrap_or_default(),
+        get_setting(&st.db, "rp_id")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        get_setting(&st.db, "rp_origin")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
     );
     let db_bytes: i64 = st
         .db
@@ -223,7 +233,8 @@ pub async fn settings_page(State(st): State<AppState>) -> Response {
     let passkeys: Vec<(i64, i64)> = st
         .db
         .call(|c| {
-            let mut stmt = c.prepare("SELECT id, created_at FROM webauthn_credentials ORDER BY id")?;
+            let mut stmt =
+                c.prepare("SELECT id, created_at FROM webauthn_credentials ORDER BY id")?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
@@ -318,16 +329,35 @@ pub struct RetentionForm {
 }
 
 pub async fn save_retention(State(st): State<AppState>, Form(f): Form<RetentionForm>) -> Response {
-    let age = f.max_age_days.as_deref().unwrap_or("").trim().parse::<i64>().ok();
-    let gb = f.max_db_gb.as_deref().unwrap_or("").trim().parse::<f64>().ok();
+    let age = f
+        .max_age_days
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .parse::<i64>()
+        .ok();
+    let gb = f
+        .max_db_gb
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .parse::<f64>()
+        .ok();
     let res: Result<()> = async {
         match age {
-            Some(d) if d > 0 => set_setting(&st.db, "retention_max_age_secs", &(d * 86_400).to_string()).await?,
+            Some(d) if d > 0 => {
+                set_setting(&st.db, "retention_max_age_secs", &(d * 86_400).to_string()).await?
+            }
             _ => clear_setting(&st.db, "retention_max_age_secs").await?,
         }
         match gb {
             Some(g) if g > 0.0 => {
-                set_setting(&st.db, "retention_max_db_bytes", &((g * 1e9) as i64).to_string()).await?
+                set_setting(
+                    &st.db,
+                    "retention_max_db_bytes",
+                    &((g * 1e9) as i64).to_string(),
+                )
+                .await?
             }
             _ => clear_setting(&st.db, "retention_max_db_bytes").await?,
         }
@@ -376,13 +406,21 @@ pub struct PasswordForm {
 
 pub async fn change_password(State(st): State<AppState>, Form(f): Form<PasswordForm>) -> Response {
     if f.new.len() < 12 {
-        return (axum::http::StatusCode::BAD_REQUEST, "password must be at least 12 characters")
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "password must be at least 12 characters",
+        )
             .into_response();
     }
     let stored: Option<String> = st
         .db
         .call(|c| {
-            Ok(c.query_row("SELECT password_hash FROM admin_credentials WHERE id = 1", [], |r| r.get(0)).ok())
+            Ok(c.query_row(
+                "SELECT password_hash FROM admin_credentials WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok())
         })
         .await
         .ok()
@@ -391,7 +429,11 @@ pub async fn change_password(State(st): State<AppState>, Form(f): Form<PasswordF
         return (axum::http::StatusCode::CONFLICT, "no admin account").into_response();
     };
     if !super::auth::verify_password(&f.current, &hash) {
-        return (axum::http::StatusCode::FORBIDDEN, "current password is wrong").into_response();
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "current password is wrong",
+        )
+            .into_response();
     }
     let new_hash = match super::auth::hash_password(&f.new) {
         Ok(h) => h,
@@ -400,7 +442,10 @@ pub async fn change_password(State(st): State<AppState>, Form(f): Form<PasswordF
     let res = st
         .db
         .call(move |c| {
-            c.execute("UPDATE admin_credentials SET password_hash = ?1 WHERE id = 1", [new_hash])?;
+            c.execute(
+                "UPDATE admin_credentials SET password_hash = ?1 WHERE id = 1",
+                [new_hash],
+            )?;
             Ok(())
         })
         .await;
@@ -445,7 +490,11 @@ fn parse_date(s: &Option<String>, end_of_day: bool) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    let date = time::Date::parse(s, &time::macros::format_description!("[year]-[month]-[day]")).ok()?;
+    let date = time::Date::parse(
+        s,
+        &time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .ok()?;
     let t = if end_of_day {
         date.with_hms(23, 59, 59).ok()?
     } else {

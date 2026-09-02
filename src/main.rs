@@ -58,10 +58,10 @@ async fn main() -> Result<()> {
             let public_listener = tokio::net::TcpListener::bind(cfg.listen).await?;
             let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
             tracing::info!(admin = %admin_addr, "admin GUI on separate listener");
-            let public_srv = axum::serve(public_listener, public)
-                .with_graceful_shutdown(shutdown_signal());
-            let admin_srv = axum::serve(admin_listener, admin_app)
-                .with_graceful_shutdown(shutdown_signal());
+            let public_srv =
+                axum::serve(public_listener, public).with_graceful_shutdown(shutdown_signal());
+            let admin_srv =
+                axum::serve(admin_listener, admin_app).with_graceful_shutdown(shutdown_signal());
             let (a, b) = tokio::join!(public_srv, admin_srv);
             a?;
             b?;

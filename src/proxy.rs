@@ -80,16 +80,28 @@ fn resp_headers_json(headers: &reqwest::header::HeaderMap) -> String {
 
 async fn models_handler(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(token) = bearer(&headers) else {
-        return openai_error(StatusCode::UNAUTHORIZED, "Missing API key", "invalid_api_key");
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "Missing API key",
+            "invalid_api_key",
+        );
     };
     let key = match keys::authenticate(&st.db, token).await {
         Ok(Some(k)) => k,
         Ok(None) => {
-            return openai_error(StatusCode::UNAUTHORIZED, "Invalid API key", "invalid_api_key")
+            return openai_error(
+                StatusCode::UNAUTHORIZED,
+                "Invalid API key",
+                "invalid_api_key",
+            )
         }
         Err(e) => {
             tracing::error!("auth failure: {e}");
-            return openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error", "internal");
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+                "internal",
+            );
         }
     };
     match registry::models_for_key(&st.db, &key).await {
@@ -102,7 +114,11 @@ async fn models_handler(State(st): State<AppState>, headers: HeaderMap) -> Respo
         .into_response(),
         Err(e) => {
             tracing::error!("models query failed: {e}");
-            openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error", "internal")
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+                "internal",
+            )
         }
     }
 }
@@ -114,7 +130,10 @@ fn extract_model(body: &[u8], content_type: &str) -> Option<String> {
         let text = String::from_utf8_lossy(body);
         let idx = text.find("name=\"model\"")?;
         let rest = &text[idx..];
-        let blank = rest.find("\r\n\r\n").map(|i| i + 4).or_else(|| rest.find("\n\n").map(|i| i + 2))?;
+        let blank = rest
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .or_else(|| rest.find("\n\n").map(|i| i + 2))?;
         let val = rest[blank..].lines().next()?.trim().trim_end_matches('\r');
         return (!val.is_empty()).then(|| val.to_string());
     }
@@ -134,16 +153,28 @@ pub async fn proxy_handler(
 
     // 1. Authenticate
     let Some(token) = bearer(&headers) else {
-        return openai_error(StatusCode::UNAUTHORIZED, "Missing API key", "invalid_api_key");
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "Missing API key",
+            "invalid_api_key",
+        );
     };
     let key = match keys::authenticate(&st.db, token).await {
         Ok(Some(k)) => k,
         Ok(None) => {
-            return openai_error(StatusCode::UNAUTHORIZED, "Invalid API key", "invalid_api_key")
+            return openai_error(
+                StatusCode::UNAUTHORIZED,
+                "Invalid API key",
+                "invalid_api_key",
+            )
         }
         Err(e) => {
             tracing::error!("auth failure: {e}");
-            return openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error", "internal");
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+                "internal",
+            );
         }
     };
 
@@ -155,9 +186,10 @@ pub async fn proxy_handler(
         .to_string();
     let model_alias = extract_model(&body, &content_type);
     let (upstream_model, backend, model_alias) = match &model_alias {
-        Some(alias) => match registry::resolve(&st.db, alias).await {
-            Ok(Some((model, backend))) => {
-                match keys::key_allows_model(&st.db, &key, model.id).await {
+        Some(alias) => {
+            match registry::resolve(&st.db, alias).await {
+                Ok(Some((model, backend))) => {
+                    match keys::key_allows_model(&st.db, &key, model.id).await {
                     Ok(true) => (Some(model.upstream_name), backend, Some(alias.clone())),
                     Ok(false) => {
                         return openai_error(
@@ -171,27 +203,42 @@ pub async fn proxy_handler(
                         return openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error", "internal");
                     }
                 }
+                }
+                Ok(None) => {
+                    return openai_error(
+                        StatusCode::NOT_FOUND,
+                        &format!(
+                            "The model `{alias}` does not exist or you do not have access to it."
+                        ),
+                        "model_not_found",
+                    )
+                }
+                Err(e) => {
+                    tracing::error!("resolve failed: {e}");
+                    return openai_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal error",
+                        "internal",
+                    );
+                }
             }
-            Ok(None) => {
-                return openai_error(
-                    StatusCode::NOT_FOUND,
-                    &format!("The model `{alias}` does not exist or you do not have access to it."),
-                    "model_not_found",
-                )
-            }
-            Err(e) => {
-                tracing::error!("resolve failed: {e}");
-                return openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error", "internal");
-            }
-        },
+        }
         None => match registry::default_backend(&st.db).await {
             Ok(Some(b)) => (None, b, None),
             Ok(None) => {
-                return openai_error(StatusCode::BAD_GATEWAY, "No backend configured", "no_backend")
+                return openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "No backend configured",
+                    "no_backend",
+                )
             }
             Err(e) => {
                 tracing::error!("default backend lookup failed: {e}");
-                return openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error", "internal");
+                return openai_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error",
+                    "internal",
+                );
             }
         },
     };
@@ -313,7 +360,13 @@ pub async fn proxy_handler(
     }
     builder
         .body(axum::body::Body::from(resp_body))
-        .unwrap_or_else(|_| openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error", "internal"))
+        .unwrap_or_else(|_| {
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+                "internal",
+            )
+        })
 }
 
 pub(crate) struct LogBase {
@@ -376,7 +429,13 @@ fn stream_response(
         .status(status.as_u16())
         .header(header::CONTENT_TYPE, resp_content_type)
         .body(axum::body::Body::from_stream(tee))
-        .unwrap_or_else(|_| openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error", "internal"))
+        .unwrap_or_else(|_| {
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+                "internal",
+            )
+        })
 }
 
 struct StreamTee {
@@ -556,7 +615,8 @@ mod tests {
 
     #[test]
     fn extract_model_from_multipart() {
-        let body = b"--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--X--\r\n";
+        let body =
+            b"--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--X--\r\n";
         assert_eq!(
             extract_model(body, "multipart/form-data; boundary=X"),
             Some("whisper-1".into())

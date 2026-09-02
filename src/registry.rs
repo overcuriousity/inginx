@@ -213,7 +213,10 @@ pub async fn make_default(db: &Db, backend_id: i64) -> Result<()> {
     db.call(move |c| {
         let tx = c.transaction()?;
         tx.execute("UPDATE backends SET is_default = 0", [])?;
-        tx.execute("UPDATE backends SET is_default = 1 WHERE id = ?1", [backend_id])?;
+        tx.execute(
+            "UPDATE backends SET is_default = 1 WHERE id = ?1",
+            [backend_id],
+        )?;
         tx.commit()?;
         Ok(())
     })
@@ -284,7 +287,9 @@ mod tests {
     #[tokio::test]
     async fn disabled_model_does_not_resolve() {
         let db = testdb().await;
-        let b = add_backend(&db, "gpu1", "http://x", None, true).await.unwrap();
+        let b = add_backend(&db, "gpu1", "http://x", None, true)
+            .await
+            .unwrap();
         let mid = add_model(&db, b, "m", "m").await.unwrap();
         db.call(move |c| {
             c.execute("UPDATE models SET enabled = 0 WHERE id = ?1", [mid])?;
@@ -298,13 +303,25 @@ mod tests {
     #[tokio::test]
     async fn models_for_key_respects_grants() {
         let db = testdb().await;
-        let b = add_backend(&db, "gpu1", "http://x", None, true).await.unwrap();
+        let b = add_backend(&db, "gpu1", "http://x", None, true)
+            .await
+            .unwrap();
         let a_id = add_model(&db, b, "a", "a").await.unwrap();
         add_model(&db, b, "b", "b").await.unwrap();
-        let plain_all = crate::keys::create(&db, "all", true, &[], None).await.unwrap();
-        let plain_one = crate::keys::create(&db, "one", false, &[a_id], None).await.unwrap();
-        let k_all = crate::keys::authenticate(&db, &plain_all).await.unwrap().unwrap();
-        let k_one = crate::keys::authenticate(&db, &plain_one).await.unwrap().unwrap();
+        let plain_all = crate::keys::create(&db, "all", true, &[], None)
+            .await
+            .unwrap();
+        let plain_one = crate::keys::create(&db, "one", false, &[a_id], None)
+            .await
+            .unwrap();
+        let k_all = crate::keys::authenticate(&db, &plain_all)
+            .await
+            .unwrap()
+            .unwrap();
+        let k_one = crate::keys::authenticate(&db, &plain_one)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(models_for_key(&db, &k_all).await.unwrap().len(), 2);
         let one = models_for_key(&db, &k_one).await.unwrap();
         assert_eq!(one.len(), 1);

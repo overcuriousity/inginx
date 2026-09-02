@@ -84,7 +84,10 @@ pub fn prepare_upstream_body(body: &[u8], upstream_model: Option<&str>) -> (Vec<
         }
     }
     if changed {
-        (serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec()), injected)
+        (
+            serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec()),
+            injected,
+        )
     } else {
         (body.to_vec(), injected)
     }

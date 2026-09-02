@@ -244,7 +244,9 @@ pub fn render_payload(body: &[u8], download_url: &str) -> Markup {
             // SSE stream: reassemble delta/content text, keep the raw bytes a click away
             let mut assembled = String::new();
             for line in text.lines() {
-                let Some(payload) = line.strip_prefix("data:") else { continue };
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue;
+                };
                 let payload = payload.trim();
                 if payload == "[DONE]" || payload.is_empty() {
                     continue;
@@ -284,16 +286,28 @@ pub fn render_payload(body: &[u8], download_url: &str) -> Markup {
 /// (ts, key_name, model, endpoint, status, latency, ttfb, prompt_tokens,
 /// completion_tokens, usage_source, error, req_headers, resp_headers)
 type DetailRow = (
-    i64, Option<String>, Option<String>, String, u16, u32, Option<u32>,
-    u32, u32, String, Option<String>, String, String,
+    i64,
+    Option<String>,
+    Option<String>,
+    String,
+    u16,
+    u32,
+    Option<u32>,
+    u32,
+    u32,
+    String,
+    Option<String>,
+    String,
+    String,
 );
 
 pub async fn log_detail(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     let idq = id.clone();
-    let row: Option<DetailRow> = match st
-        .db
-        .call(move |c| {
-            let v = c
+    let row: Option<DetailRow> =
+        match st
+            .db
+            .call(move |c| {
+                let v = c
                 .query_row(
                     "SELECT r.ts, k.name, r.model, r.endpoint, r.status, r.latency_ms, r.ttfb_ms,
                             r.prompt_tokens, r.completion_tokens, r.usage_source, r.error,
@@ -313,14 +327,29 @@ pub async fn log_detail(State(st): State<AppState>, Path(id): Path<String>) -> R
                     rusqlite::Error::QueryReturnedNoRows => Ok(None),
                     e => Err(e),
                 })?;
-            Ok(v)
-        })
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => return err500(e),
-    };
-    let Some((ts, key_name, model, endpoint, status, latency, ttfb, pt, ct, src, error, req_h, resp_h)) = row else {
+                Ok(v)
+            })
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return err500(e),
+        };
+    let Some((
+        ts,
+        key_name,
+        model,
+        endpoint,
+        status,
+        latency,
+        ttfb,
+        pt,
+        ct,
+        src,
+        error,
+        req_h,
+        resp_h,
+    )) = row
+    else {
         return (StatusCode::NOT_FOUND, "no such request").into_response();
     };
     let bodies = match crate::logstore::get_bodies(&st.db, &id).await {

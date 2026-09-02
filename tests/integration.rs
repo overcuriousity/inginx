@@ -83,7 +83,9 @@ async fn setup() -> Ctx {
     let b = registry::add_backend(&db, "mock", &format!("http://{upstream}"), None, true)
         .await
         .unwrap();
-    registry::add_model(&db, b, "m-upstream", "m").await.unwrap();
+    registry::add_model(&db, b, "m-upstream", "m")
+        .await
+        .unwrap();
     let key = keys::create(&db, "test", true, &[], None).await.unwrap();
     let state = proxy::AppState {
         db: db.clone(),
@@ -213,8 +215,10 @@ async fn client_disconnect_still_logs() {
         let err: Option<String> = ctx
             .db
             .call(|c| {
-                Ok(c.query_row("SELECT error FROM requests LIMIT 1", [], |r| r.get(0))
-                    .ok())
+                Ok(
+                    c.query_row("SELECT error FROM requests LIMIT 1", [], |r| r.get(0))
+                        .ok(),
+                )
             })
             .await
             .unwrap();
@@ -269,10 +273,7 @@ async fn tts_binary_response_estimated_usage() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers().get("content-type").unwrap(),
-        "audio/wav"
-    );
+    assert_eq!(resp.headers().get("content-type").unwrap(), "audio/wav");
     let body = resp.bytes().await.unwrap();
     assert_eq!(&body[..], b"RIFFfakewavdata");
     wait_for_rows(&ctx.db, 1).await;
@@ -326,7 +327,9 @@ async fn unreachable_backend_502_openai_shape() {
     let b = registry::add_backend(&db, "dead", &format!("http://{dead_addr}"), None, true)
         .await
         .unwrap();
-    registry::add_model(&db, b, "dead-m", "dead-m").await.unwrap();
+    registry::add_model(&db, b, "dead-m", "dead-m")
+        .await
+        .unwrap();
     let key = keys::create(&db, "k", true, &[], None).await.unwrap();
     let state = proxy::AppState {
         db: db.clone(),
@@ -367,11 +370,19 @@ async fn merged_listener_serves_api_and_admin() {
     let addr = spawn_app(app).await;
     let client = reqwest::Client::new();
     // admin login page renders
-    let r = client.get(format!("http://{addr}/admin/login")).send().await.unwrap();
+    let r = client
+        .get(format!("http://{addr}/admin/login"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     assert!(r.text().await.unwrap().contains("Sign in"));
     // API answers on the same port (401 without key, OpenAI shape)
-    let r = client.get(format!("http://{addr}/v1/models")).send().await.unwrap();
+    let r = client
+        .get(format!("http://{addr}/v1/models"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 401);
     let v: serde_json::Value = r.json().await.unwrap();
     assert_eq!(v["error"]["code"], "invalid_api_key");
