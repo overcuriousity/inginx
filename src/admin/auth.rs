@@ -7,8 +7,8 @@ use argon2::password_hash::{
 };
 use argon2::Argon2;
 use axum::{
-    extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{ConnectInfo, FromRequestParts, Query, State},
+    http::{header, request::Parts, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -17,6 +17,27 @@ use axum::{
 use maud::{html, Markup, DOCTYPE};
 use rand::RngCore;
 use serde::Deserialize;
+use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+/// The peer address, or `None` when the server was not told one — which is the
+/// case in unit tests that drive the router directly. A never-rejecting
+/// extractor, so a missing connect-info degrades to "unknown address" rather
+/// than a 500; `Option<ConnectInfo<_>>` is not itself an extractor in axum
+/// 0.8, which is why this wrapper exists.
+struct PeerAddr(Option<SocketAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
+    type Rejection = Infallible;
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(PeerAddr(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0),
+        ))
+    }
+}
 
 const SESSION_COOKIE: &str = "inginx_session";
 const SESSION_TTL: i64 = 7 * 24 * 3600;
@@ -87,8 +108,79 @@ fn cookie_value(headers: &HeaderMap) -> Option<String> {
     })
 }
 
-fn set_session_cookie(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/admin; Max-Age={SESSION_TTL}")
+/// `Secure` is added only when the request arrived over TLS. inginx terminates
+/// plain HTTP and expects TLS at a reverse proxy, so the signal is
+/// `X-Forwarded-Proto`; adding `Secure` unconditionally would silently break
+/// the cookie on a plain-HTTP localhost run, where the browser drops Secure
+/// cookies and the admin could never stay logged in. `SameSite=Lax` is the
+/// CSRF defense — the cookie is simply not sent on a cross-site POST, which is
+/// why there are no CSRF tokens anywhere in this codebase and there never need
+/// to be.
+fn set_session_cookie(token: &str, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
+    format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/admin; Max-Age={SESSION_TTL}{sec}"
+    )
+}
+
+/// A cleared cookie carrying the same attributes, so the browser matches and
+/// drops it. `Secure` has to agree with how it was set or some browsers ignore
+/// the deletion.
+fn clear_session_cookie(secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/admin; Max-Age=0{sec}")
+}
+
+/// Whether this request reached us over TLS. inginx serves plain HTTP, so the
+/// only signal is a fronting proxy's `X-Forwarded-Proto: https` — and that is
+/// believed only when `trust_proxy_headers` says a proxy is actually there. A
+/// client reaching inginx directly cannot forge itself a `Secure` cookie it
+/// would then never send back.
+fn is_https(headers: &HeaderMap, trust_proxy: bool) -> bool {
+    trust_proxy
+        && headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("https"))
+            .unwrap_or(false)
+}
+
+/// The address the login lockout is keyed on.
+///
+/// Without a trusted proxy this is the peer the server actually sees, and the
+/// forwarding headers are ignored — they are attacker-set on a direct
+/// connection, and keying the brute-force wall on a spoofable header would let
+/// a guesser rotate one value to walk around it.
+///
+/// With `trust_proxy_headers`, the peer *is* the proxy and the same peer for
+/// everyone, so keying on it would put all clients in one lockout bucket — an
+/// attacker could lock the real admin out, and no two clients could be told
+/// apart. There the proxy is the authority: `X-Real-IP` if it set one, else
+/// the rightmost `X-Forwarded-For` entry, which is the address the nearest
+/// (trusted) proxy observed and appended — a client-supplied prefix cannot
+/// displace it.
+fn client_ip(headers: &HeaderMap, peer: PeerAddr, trust_proxy: bool) -> IpAddr {
+    let fallback = || {
+        peer.0
+            .map(|a| a.ip())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+    };
+    if !trust_proxy {
+        return fallback();
+    }
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+    {
+        return ip;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.rsplit(',').next())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+        .unwrap_or_else(fallback)
 }
 
 /// Looks up the session for this request. Returns (token, full).
@@ -129,38 +221,38 @@ pub async fn require_session(
     }
 }
 
+/// The pages you reach without a session: signing in, the second factor, and
+/// the one-time account setup. They carry the same identity as the admin
+/// itself — same stylesheet, same mark, same theme — rather than the private
+/// copy of a dark palette they used to inline. One card, centred, and no top
+/// row: there is nowhere to navigate to yet.
 fn page(title: &str, body: Markup) -> Html<String> {
     Html(
         html! {
             (DOCTYPE)
-            html {
-                head {
-                    meta charset="utf-8";
-                    meta name="viewport" content="width=device-width, initial-scale=1";
-                    title { (title) " · inginx" }
-                    style { (maud::PreEscaped(AUTH_CSS)) }
+            html lang="en" {
+                (crate::admin::pages::head(title))
+                body {
+                    div class="shell" {
+                        div class="regions regions-center" {
+                            div {
+                                div class="brand-lockup" {
+                                    (crate::admin::pages::mark())
+                                    span class="brand-name" { "inginx" }
+                                }
+                                div class="card" {
+                                    h2 { (title) }
+                                    (body)
+                                }
+                            }
+                        }
+                    }
                 }
-                body { div class="card" { h1 { (title) } (body) } }
             }
         }
         .into_string(),
     )
 }
-
-const AUTH_CSS: &str = r#"
-:root { color-scheme: dark; }
-body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-  background:#0d1117; color:#e6edf3; font:15px/1.5 system-ui, sans-serif; }
-.card { background:#161b22; border:1px solid #30363d; border-radius:12px; padding:2rem 2.5rem; min-width:320px; }
-h1 { font-size:1.2rem; margin:0 0 1rem; }
-label { display:block; margin:.8rem 0 .25rem; color:#8b949e; font-size:.85rem; }
-input { width:100%; box-sizing:border-box; padding:.5rem .7rem; border-radius:8px;
-  border:1px solid #30363d; background:#0d1117; color:#e6edf3; font-size:1rem; }
-button { margin-top:1.2rem; width:100%; padding:.6rem; border-radius:8px; border:0;
-  background:#2f81f7; color:#fff; font-size:1rem; cursor:pointer; }
-button:hover { background:#1f6feb; }
-.err { color:#f85149; margin-top:.8rem; font-size:.9rem; }
-"#;
 
 #[derive(Deserialize)]
 struct SetupQuery {
@@ -178,7 +270,7 @@ async fn setup_form(State(st): State<AppState>, Query(q): Query<SetupQuery>) -> 
                     input type="text" name="username" required autofocus;
                     label { "Password" }
                     input type="password" name="password" required minlength="12";
-                    button { "Create account" }
+                    button class="primary" { "Create account" }
                 }
             },
         )
@@ -242,19 +334,8 @@ async fn setup_submit(State(st): State<AppState>, Form(f): Form<SetupForm>) -> R
     }
 }
 
-async fn login_form() -> Html<String> {
-    page(
-        "Sign in",
-        html! {
-            form method="post" action="/admin/login" {
-                label { "Username" }
-                input type="text" name="username" required autofocus;
-                label { "Password" }
-                input type="password" name="password" required;
-                button { "Sign in" }
-            }
-        },
-    )
+async fn login_form() -> Response {
+    login_page(None)
 }
 
 #[derive(Deserialize)]
@@ -263,7 +344,69 @@ struct LoginForm {
     password: String,
 }
 
-async fn login_submit(State(st): State<AppState>, Form(f): Form<LoginForm>) -> Response {
+/// The sign-in form, optionally carrying an error line. One place, so the
+/// three ways in — first visit, wrong password, locked out — cannot drift
+/// apart.
+fn login_page(err: Option<&str>) -> Response {
+    page(
+        "Sign in",
+        html! {
+            form method="post" action="/admin/login" {
+                label { "Username" }
+                input type="text" name="username" required autofocus;
+                label { "Password" }
+                input type="password" name="password" required;
+                button class="primary" { "Sign in" }
+                @if let Some(e) = err { p class="err" { (e) } }
+            }
+        },
+    )
+    .into_response()
+}
+
+/// A valid Argon2 hash of a fixed string, computed once. When the username is
+/// wrong we verify the password against this so the request costs the same as
+/// a right-username-wrong-password one. Without it, "no such user" returned in
+/// microseconds while a real miss spent Argon2's tens of milliseconds — a
+/// timing oracle that confirmed the account name for free.
+fn dummy_hash() -> &'static str {
+    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    H.get_or_init(|| hash_password("inginx-timing-equalizer").expect("hash dummy"))
+}
+
+async fn login_submit(
+    State(st): State<AppState>,
+    peer: PeerAddr,
+    headers: HeaderMap,
+    Form(f): Form<LoginForm>,
+) -> Response {
+    let ip = client_ip(&headers, peer, st.trust_proxy_headers);
+    let secure = is_https(&headers, st.trust_proxy_headers);
+
+    // The wall goes up before the password is even looked at: a locked
+    // address is turned away without a hash computed or a row read.
+    if let Some(left) = st.login_throttle.check(ip) {
+        let secs = left.as_secs().max(1);
+        tracing::warn!(%ip, "login attempt from locked-out address");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, secs.to_string())],
+            Html(
+                page(
+                    "Sign in",
+                    html! {
+                        p class="err" {
+                            "Too many failed attempts. Try again in "
+                            (secs) " seconds."
+                        }
+                    },
+                )
+                .0,
+            ),
+        )
+            .into_response();
+    }
+
     let creds: Option<(String, String)> = st
         .db
         .call(|c| {
@@ -283,25 +426,24 @@ async fn login_submit(State(st): State<AppState>, Form(f): Form<LoginForm>) -> R
         .await
         .ok()
         .flatten();
-    let ok = creds
-        .map(|(user, hash)| user == f.username && verify_password(&f.password, &hash))
-        .unwrap_or(false);
+    // Always run a verification, against the real hash or the dummy, so the
+    // answer takes the same time whether or not the username matched.
+    let ok = match &creds {
+        Some((user, hash)) => {
+            let pw_ok = verify_password(&f.password, hash);
+            *user == f.username && pw_ok
+        }
+        None => {
+            verify_password(&f.password, dummy_hash());
+            false
+        }
+    };
     if !ok {
-        return page(
-            "Sign in",
-            html! {
-                form method="post" action="/admin/login" {
-                    label { "Username" }
-                    input type="text" name="username" required autofocus;
-                    label { "Password" }
-                    input type="password" name="password" required;
-                    button { "Sign in" }
-                    p class="err" { "Invalid username or password." }
-                }
-            },
-        )
-        .into_response();
+        st.login_throttle.on_failure(ip);
+        return login_page(Some("Invalid username or password."));
     }
+    st.login_throttle.on_success(ip);
+
     let has_passkeys: bool = st
         .db
         .call(|c| {
@@ -319,7 +461,7 @@ async fn login_submit(State(st): State<AppState>, Form(f): Form<LoginForm>) -> R
     };
     match create_session(&st.db, full).await {
         Ok(token) => (
-            [(header::SET_COOKIE, set_session_cookie(&token))],
+            [(header::SET_COOKIE, set_session_cookie(&token, secure))],
             Redirect::to(target),
         )
             .into_response(),
@@ -343,7 +485,7 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
     (
         [(
             header::SET_COOKIE,
-            format!("{SESSION_COOKIE}=; Path=/admin; Max-Age=0"),
+            clear_session_cookie(is_https(&headers, st.trust_proxy_headers)),
         )],
         Redirect::to("/admin/login"),
     )
@@ -520,7 +662,7 @@ async fn auth_finish(
     let Some((token, _)) = session_state(&st.db, &headers).await else {
         return (StatusCode::UNAUTHORIZED, "no session").into_response();
     };
-    let result: Result<()> = async {
+    let result: Result<String> = async {
         let webauthn = webauthn_for(&st.db, &headers).await?;
         let cred: PublicKeyCredential = serde_json::from_slice(&body)?;
         let state_json = get_setting(&st.db, "webauthn_auth_state")
@@ -528,18 +670,30 @@ async fn auth_finish(
             .ok_or_else(|| anyhow::anyhow!("no authentication in progress"))?;
         let auth_state: PasskeyAuthentication = serde_json::from_str(&state_json)?;
         webauthn.finish_passkey_authentication(&cred, &auth_state)?;
+        // Rotate rather than elevate in place. The half-session token existed
+        // before the second factor was proven; minting a fresh full-session
+        // token and dropping the old one means a token that ever leaked as a
+        // half-session cannot be the one that ends up fully privileged.
+        let new_token = create_session(&st.db, true).await?;
         st.db
             .call(move |c| {
-                c.execute("UPDATE sessions SET full = 1 WHERE token = ?1", [token])?;
+                c.execute("DELETE FROM sessions WHERE token = ?1", [token])?;
                 c.execute("DELETE FROM settings WHERE key = 'webauthn_auth_state'", [])?;
                 Ok(())
             })
             .await?;
-        Ok(())
+        Ok(new_token)
     }
     .await;
     match result {
-        Ok(()) => axum::Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(new_token) => (
+            [(
+                header::SET_COOKIE,
+                set_session_cookie(&new_token, is_https(&headers, st.trust_proxy_headers)),
+            )],
+            axum::Json(serde_json::json!({"ok": true})),
+        )
+            .into_response(),
         Err(e) => {
             tracing::warn!("webauthn auth finish rejected: {e}");
             (StatusCode::UNAUTHORIZED, "authentication rejected").into_response()
@@ -551,25 +705,17 @@ async fn twofa_page(State(st): State<AppState>, headers: HeaderMap) -> Response 
     if session_state(&st.db, &headers).await.is_none() {
         return Redirect::to("/admin/login").into_response();
     }
+    // No inline script: the button carries data attributes and webauthn.js
+    // (served, same-origin) wires them on load, so the page satisfies a
+    // `script-src 'self'` CSP with no nonce. `data-passkey-redirect` is where
+    // it goes on success.
     page(
         "Two-factor authentication",
         html! {
             p { "Confirm your identity with your passkey." }
-            button id="go" { "Use passkey" }
-            p class="err" id="err" {}
-            script { (maud::PreEscaped(include_str!("../../assets/webauthn.js"))) }
-            script {
-                (maud::PreEscaped(r#"
-                document.getElementById('go').addEventListener('click', async () => {
-                    try {
-                        await window.inginxAuthenticatePasskey();
-                        location.href = '/admin';
-                    } catch (e) {
-                        document.getElementById('err').textContent = e.message;
-                    }
-                });
-                "#))
-            }
+            button class="primary" data-passkey-auth data-passkey-redirect="/admin" { "Use passkey" }
+            p class="err" data-passkey-error {}
+            script src="/admin/assets/webauthn.js" defer {}
         },
     )
     .into_response()
@@ -605,11 +751,7 @@ mod tests {
 
     async fn state() -> AppState {
         let db = testdb().await;
-        AppState {
-            log: spawn_writer(db.clone()),
-            db,
-            http: reqwest::Client::new(),
-        }
+        AppState::for_test(db.clone(), spawn_writer(db.clone()), reqwest::Client::new())
     }
 
     fn full_router(st: AppState) -> Router {
@@ -797,5 +939,108 @@ mod tests {
         let full = create_session(&st.db, true).await.unwrap();
         let r = req(&app, "GET", "/admin/keys", None, Some(&full)).await;
         assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn login_locks_out_after_repeated_failures() {
+        let st = state().await;
+        let app = full_router(st.clone());
+        setup_admin(&st, &app).await;
+
+        // The tests carry no connect-info, so every attempt keys on the same
+        // unknown address — one bucket, which is what we want to watch fill.
+        // `for_test` sets the threshold to 5.
+        for _ in 0..5 {
+            let r = req(
+                &app,
+                "POST",
+                "/admin/login",
+                Some("username=admin&password=wrong"),
+                None,
+            )
+            .await;
+            // Each failure re-renders the form; none is a lockout yet.
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+
+        // The next attempt is refused before the password is even checked —
+        // and the *correct* password does not get through while locked.
+        let r = req(
+            &app,
+            "POST",
+            "/admin/login",
+            Some("username=admin&password=longenoughpw1"),
+            None,
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(r.headers().get(header::RETRY_AFTER).is_some());
+        assert!(r.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[test]
+    fn client_ip_trusts_proxy_headers_only_when_enabled() {
+        let peer = || PeerAddr(Some("203.0.113.9:5000".parse().unwrap()));
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        h.insert("x-real-ip", "198.51.100.7".parse().unwrap());
+
+        // Off: the forwarded headers are ignored, we key on the real peer.
+        assert_eq!(
+            client_ip(&h, peer(), false),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // On: the proxy's client address wins.
+        assert_eq!(
+            client_ip(&h, peer(), true),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+
+        // A client-supplied prefix cannot displace the address the proxy
+        // appended: with only XFF present, the rightmost entry is used.
+        let mut xff = HeaderMap::new();
+        xff.insert("x-forwarded-for", "1.1.1.1, 198.51.100.7".parse().unwrap());
+        assert_eq!(
+            client_ip(&xff, peer(), true),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn https_only_believed_behind_trusted_proxy() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(!is_https(&h, false), "not trusted: proto header ignored");
+        assert!(is_https(&h, true), "trusted: proto header honored");
+    }
+
+    #[tokio::test]
+    async fn login_success_before_threshold_is_not_blocked() {
+        let st = state().await;
+        let app = full_router(st.clone());
+        setup_admin(&st, &app).await;
+
+        // A few misses, then the right password — under the threshold, the
+        // good login still goes through and clears the counter.
+        for _ in 0..3 {
+            req(
+                &app,
+                "POST",
+                "/admin/login",
+                Some("username=admin&password=wrong"),
+                None,
+            )
+            .await;
+        }
+        let r = req(
+            &app,
+            "POST",
+            "/admin/login",
+            Some("username=admin&password=longenoughpw1"),
+            None,
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        assert!(r.headers().get(header::SET_COOKIE).is_some());
     }
 }

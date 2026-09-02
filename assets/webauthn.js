@@ -64,4 +64,35 @@
       },
     });
   };
+
+  // The buttons wire themselves from data attributes rather than an inline
+  // handler, so the 2FA and settings pages need no `script-src` exception. A
+  // failure is written to `[data-passkey-error]`; enrol reloads, auth follows
+  // `data-passkey-redirect`.
+  function wire() {
+    var err = document.querySelector("[data-passkey-error]");
+    var fail = function (e) { if (err) err.textContent = e.message || String(e); };
+
+    var enroll = document.querySelector("[data-passkey-enroll]");
+    if (enroll) {
+      enroll.addEventListener("click", async function () {
+        try { await window.inginxRegisterPasskey(); location.reload(); }
+        catch (e) { fail(e); }
+      });
+    }
+    var auth = document.querySelector("[data-passkey-auth]");
+    if (auth) {
+      auth.addEventListener("click", async function () {
+        try {
+          await window.inginxAuthenticatePasskey();
+          location.href = auth.getAttribute("data-passkey-redirect") || "/admin";
+        } catch (e) { fail(e); }
+      });
+    }
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", wire);
+  } else {
+    wire();
+  }
 })();

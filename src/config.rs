@@ -12,6 +12,30 @@ pub struct Config {
     pub admin_listen: Option<SocketAddr>,
     pub db_path: PathBuf,
     pub log_level: String,
+    /// Largest request body the proxy will buffer, in bytes. The body is read
+    /// into memory before it can be forwarded, so this is the per-request
+    /// memory an authenticated client can pin — and, without the pre-auth
+    /// gate, it used to be what an anonymous one could. 32 MiB covers a
+    /// base64 image or a short audio clip; raise it for large transcription
+    /// uploads, but know what each concurrent request then costs.
+    pub max_body_bytes: usize,
+    /// Failed admin logins from one address before it is locked out. The
+    /// counter is per source IP and resets on a success.
+    pub login_max_failures: u32,
+    /// How long a locked-out address stays locked, in seconds. Doubles on each
+    /// further lockout up to an hour, so a persistent guesser slows to a crawl
+    /// while a fat-fingered admin waits only the base interval.
+    pub login_lockout_secs: u64,
+    /// Set this only when inginx sits behind a reverse proxy that is the sole
+    /// way in. It then believes the proxy about the client: `X-Real-IP` /
+    /// `X-Forwarded-For` for the address the login lockout is keyed on, and
+    /// `X-Forwarded-Proto` for whether to mark the session cookie `Secure`.
+    /// Left off (the default), those headers are ignored, because a client
+    /// that can reach inginx directly could forge them — spoofing an IP to
+    /// walk around the brute-force wall. It also silences the startup warning
+    /// about the admin GUI sharing a public listener: with a proxy in front,
+    /// that is a deliberate arrangement rather than an exposure.
+    pub trust_proxy_headers: bool,
 }
 
 impl Default for Config {
@@ -21,6 +45,10 @@ impl Default for Config {
             admin_listen: None,
             db_path: PathBuf::from("inginx.db"),
             log_level: "info".into(),
+            max_body_bytes: 32 * 1024 * 1024,
+            login_max_failures: 5,
+            login_lockout_secs: 300,
+            trust_proxy_headers: false,
         }
     }
 }

@@ -1,0 +1,149 @@
+//! Brute-force throttle for the admin login.
+//!
+//! One fixed admin account behind a password is exactly the shape an online
+//! guesser likes: no username to discover, one endpoint to hammer. Argon2 puts
+//! a floor of tens of milliseconds under each try, but a floor is not a wall —
+//! at even 20 tries a second a weak password falls in a day. This adds the
+//! wall: after a handful of failures from one address the address is locked
+//! out, and the lockout doubles each time it is re-earned.
+//!
+//! Kept in memory on purpose. The state is a few counters that are meaningless
+//! across a restart — a restart is itself a reset, and an attacker who can
+//! restart the process has already won — so it costs nothing to lose and a
+//! table write per login attempt to persist. The map is swept of expired
+//! entries on every check, so it cannot grow beyond the set of addresses that
+//! have recently failed.
+//!
+//! The key is the peer address the server actually sees. Behind a reverse
+//! proxy that is the proxy, and the lockout is then shared by everyone behind
+//! it — which is why `main` warns when the admin surface faces a network and
+//! the operator, not this file, is where per-client keying belongs. We do not
+//! trust `X-Forwarded-For` for the key: it is attacker-set, and keying on it
+//! would let a guesser rotate one header to dodge the wall entirely.
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Ceiling on the doubling lockout. Long enough to make sustained guessing
+/// pointless, short enough that a locked-out real admin is not locked out for
+/// the day.
+const MAX_LOCKOUT: Duration = Duration::from_secs(3600);
+
+struct Entry {
+    /// Consecutive failures since the last success or lockout expiry.
+    fails: u32,
+    /// How long the *next* lockout lasts; doubles each time one is earned.
+    next_lockout: Duration,
+    /// When the current lockout ends, if the address is locked.
+    locked_until: Option<Instant>,
+}
+
+pub struct LoginThrottle {
+    inner: Mutex<HashMap<IpAddr, Entry>>,
+    max_failures: u32,
+    base_lockout: Duration,
+}
+
+impl LoginThrottle {
+    pub fn new(max_failures: u32, base_lockout: Duration) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            // A zero threshold would lock on the first try; a zero interval
+            // would be no lockout at all. Clamp both so a misconfiguration
+            // fails safe rather than open or bricked.
+            max_failures: max_failures.max(1),
+            base_lockout: base_lockout.max(Duration::from_secs(1)),
+        }
+    }
+
+    /// If `ip` is currently locked out, the time remaining. `None` means the
+    /// attempt may proceed. Sweeps expired entries as it goes.
+    pub fn check(&self, ip: IpAddr) -> Option<Duration> {
+        let now = Instant::now();
+        let mut map = self.inner.lock().unwrap();
+        map.retain(|_, e| e.locked_until.map(|t| t > now).unwrap_or(false) || e.fails > 0);
+        let e = map.get(&ip)?;
+        e.locked_until
+            .and_then(|t| t.checked_duration_since(now))
+            .filter(|d| !d.is_zero())
+    }
+
+    /// Records a failed attempt from `ip`, arming or extending its lockout once
+    /// the threshold is reached.
+    pub fn on_failure(&self, ip: IpAddr) {
+        let now = Instant::now();
+        let mut map = self.inner.lock().unwrap();
+        let e = map.entry(ip).or_insert(Entry {
+            fails: 0,
+            next_lockout: self.base_lockout,
+            locked_until: None,
+        });
+        e.fails += 1;
+        if e.fails >= self.max_failures {
+            e.locked_until = Some(now + e.next_lockout);
+            e.fails = 0;
+            e.next_lockout = (e.next_lockout * 2).min(MAX_LOCKOUT);
+        }
+    }
+
+    /// Clears the record for `ip` after a successful login.
+    pub fn on_success(&self, ip: IpAddr) {
+        self.inner.lock().unwrap().remove(&ip);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, n])
+    }
+
+    #[test]
+    fn locks_after_threshold_and_clears_on_success() {
+        let t = LoginThrottle::new(3, Duration::from_secs(60));
+        let a = ip(1);
+        assert!(t.check(a).is_none());
+        t.on_failure(a);
+        t.on_failure(a);
+        assert!(t.check(a).is_none(), "under threshold, not locked");
+        t.on_failure(a);
+        let left = t.check(a).expect("locked after threshold");
+        assert!(left <= Duration::from_secs(60) && left > Duration::from_secs(50));
+        // A different address is unaffected.
+        assert!(t.check(ip(2)).is_none());
+    }
+
+    #[test]
+    fn lockout_doubles() {
+        let t = LoginThrottle::new(1, Duration::from_secs(10));
+        let a = ip(3);
+        t.on_failure(a);
+        let first = t.check(a).unwrap();
+        assert!(first > Duration::from_secs(8) && first <= Duration::from_secs(10));
+        // Force expiry so the next failure re-locks with a doubled interval.
+        {
+            let mut map = t.inner.lock().unwrap();
+            map.get_mut(&a).unwrap().locked_until = Some(Instant::now());
+        }
+        t.on_failure(a);
+        let second = t.check(a).unwrap();
+        assert!(
+            second > Duration::from_secs(18),
+            "doubled to ~20s: {second:?}"
+        );
+    }
+
+    #[test]
+    fn success_resets() {
+        let t = LoginThrottle::new(2, Duration::from_secs(60));
+        let a = ip(4);
+        t.on_failure(a);
+        t.on_success(a);
+        t.on_failure(a);
+        assert!(t.check(a).is_none(), "counter reset by the success");
+    }
+}

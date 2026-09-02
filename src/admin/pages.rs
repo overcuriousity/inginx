@@ -2,11 +2,99 @@ use crate::db::Db;
 use crate::proxy::AppState;
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
-    http::{header, StatusCode},
+    extract::{Path, Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::Next,
     response::{Html, IntoResponse, Response},
 };
 use maud::{html, Markup, DOCTYPE};
+
+/// One Content-Security-Policy for the whole admin. It is strict because it
+/// can be: every script and style is a served, same-origin file, so nothing
+/// here needs `'unsafe-inline'` or a nonce. `script-src 'self'` is the load-
+/// bearing line — an injected `<script>` or `onclick` simply does not run —
+/// and it is only honest because the pages carry no inline script (the theme
+/// boot, the charts and the passkey buttons were all moved out to files for
+/// exactly this). `frame-ancestors 'none'` is the clickjacking defense;
+/// `object-src`/`base-uri 'none'` close two old injection side doors;
+/// `form-action 'self'` keeps a form from being retargeted off-origin.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; \
+base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+
+/// Response-header hardening for every admin response. These are cheap, they
+/// never depend on the request, and forgetting one on a single route is
+/// exactly how these gaps happen — so they go on as a layer over the whole
+/// admin router rather than per handler.
+pub async fn security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    let set = |h: &mut axum::http::HeaderMap, k: header::HeaderName, v: &'static str| {
+        h.insert(k, HeaderValue::from_static(v));
+    };
+    set(h, header::CONTENT_SECURITY_POLICY, CSP);
+    set(h, header::X_FRAME_OPTIONS, "DENY");
+    set(h, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    set(h, header::REFERRER_POLICY, "no-referrer");
+    h.insert(
+        header::HeaderName::from_static("cross-origin-opener-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    // Only pages get `no-store`; the static assets set their own long
+    // `max-age` and must keep it, so an existing Cache-Control is left alone.
+    if !h.contains_key(header::CACHE_CONTROL) {
+        set(h, header::CACHE_CONTROL, "no-store");
+    }
+    resp
+}
+
+/// The inginx mark, inlined rather than `<img src="/admin/assets/logo.svg">`
+/// so it inherits the page's colour: an `<img>` is its own document and sees
+/// neither `currentColor` nor the theme override. Same geometry as
+/// assets/logo.svg — edit both. Decorative; the link around it carries the
+/// label.
+pub fn mark() -> Markup {
+    html! {
+        svg class="mark" viewBox="0 0 64 64" fill="none" aria-hidden="true" focusable="false" {
+            g stroke="currentColor" stroke-width="2" stroke-linecap="round" {
+                path d="M12 16 L32 32 M12 32 L32 32 M12 48 L32 32 M32 32 L52 18 M32 32 L52 46" {}
+            }
+            g fill="currentColor" opacity="0.35" {
+                circle cx="12" cy="16" r="2.5" {}
+                circle cx="12" cy="32" r="2.5" {}
+                circle cx="12" cy="48" r="2.5" {}
+            }
+            g fill="currentColor" {
+                circle cx="52" cy="18" r="3.5" {}
+                circle cx="52" cy="46" r="3.5" {}
+                circle cx="32" cy="32" r="6" {}
+            }
+        }
+    }
+}
+
+/// The `<head>` every page shares: the pre-paint theme boot, the stylesheet,
+/// the fonts' colours for an installed window, and nothing a page has to
+/// remember.
+pub fn head(title: &str) -> Markup {
+    html! {
+        head {
+            meta charset="utf-8";
+            meta name="viewport" content="width=device-width, initial-scale=1";
+            // Blocking and same-origin, ahead of the stylesheet, so a stored
+            // theme is applied before the first paint. A served file rather
+            // than an inline script, so the Content-Security-Policy can forbid
+            // inline script entirely — see `security_headers`.
+            script src="/admin/assets/boot.js" {}
+            title { (title) " · inginx" }
+            link rel="icon" href="/admin/assets/logo.svg" type="image/svg+xml";
+            meta name="theme-color" content="#f8f6f1" media="(prefers-color-scheme: light)";
+            meta name="theme-color" content="#0e1015" media="(prefers-color-scheme: dark)";
+            link rel="stylesheet" href="/admin/assets/app.css";
+            script src="/admin/assets/app.js" defer {}
+        }
+    }
+}
 
 pub fn layout(title: &str, active: &str, body: Markup) -> Markup {
     let nav = [
@@ -16,31 +104,49 @@ pub fn layout(title: &str, active: &str, body: Markup) -> Markup {
         ("/admin/logs", "Logs", "logs"),
         ("/admin/settings", "Settings", "settings"),
     ];
+    // Prose or a grid: Settings is forms and sentences and takes a reading
+    // measure; everything else is a table and is as wide as its columns need.
+    // Decided here from the page's own key rather than passed in by every
+    // caller, because a page that knows its name already knows which it is.
+    let regions = if active == "settings" {
+        "regions regions-focus"
+    } else {
+        "regions regions-table"
+    };
     html! {
         (DOCTYPE)
-        html {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) " · inginx" }
-                link rel="stylesheet" href="/admin/assets/app.css";
-                script src="/admin/assets/htmx.min.js" {}
-            }
+        html lang="en" {
+            (head(title))
             body {
-                nav class="sidebar" {
-                    div class="brand" { "in" span { "ginx" } }
-                    @for (href, label, key) in nav {
-                        a href=(href) class=(if key == active { "active" } else { "" }) { (label) }
-                    }
-                    div class="spacer" {}
-                    form method="post" action="/admin/logout" {
-                        button type="submit" { "Sign out" }
+                // Chrome, not content. Outside `.shell` so the rule under the
+                // row spans the window rather than stopping at the measure the
+                // page below happens to use.
+                header class="topbar" {
+                    nav class="top" {
+                        a href="/admin" class="brand" aria-label="inginx" {
+                            (mark())
+                            span { "inginx" }
+                        }
+                        @for (href, label, key) in nav {
+                            a href=(href) aria-current=[(key == active).then_some("page")] { (label) }
+                        }
+                        span class="spacer" {}
+                        button class="ghost btn-sm" type="button" data-theme-toggle
+                            aria-label="Switch between dark and light" {
+                            span data-theme-label { "Theme" }
+                        }
+                        form method="post" action="/admin/logout" class="inline" {
+                            button class="ghost btn-sm" type="submit" { "Sign out" }
+                        }
                     }
                 }
-                main {
-                    h1 { (title) }
-                    (body)
+                div class="shell" {
+                    div class=(regions) {
+                        div { h1 { (title) } }
+                        (body)
+                    }
                 }
+                script src="/admin/assets/htmx.min.js" {}
             }
         }
     }
@@ -49,6 +155,29 @@ pub fn layout(title: &str, active: &str, body: Markup) -> Markup {
 pub async fn assets(Path(file): Path<String>) -> Response {
     let (bytes, ctype): (&'static [u8], &str) = match file.as_str() {
         "app.css" => (include_bytes!("../../assets/app.css"), "text/css"),
+        "app.js" => (include_bytes!("../../assets/app.js"), "text/javascript"),
+        "boot.js" => (include_bytes!("../../assets/boot.js"), "text/javascript"),
+        "dashboard.js" => (
+            include_bytes!("../../assets/dashboard.js"),
+            "text/javascript",
+        ),
+        "logo.svg" => (include_bytes!("../../assets/logo.svg"), "image/svg+xml"),
+        "inter-400.woff2" => (
+            include_bytes!("../../assets/fonts/inter-400.woff2"),
+            "font/woff2",
+        ),
+        "inter-500.woff2" => (
+            include_bytes!("../../assets/fonts/inter-500.woff2"),
+            "font/woff2",
+        ),
+        "inter-600.woff2" => (
+            include_bytes!("../../assets/fonts/inter-600.woff2"),
+            "font/woff2",
+        ),
+        "jetbrains-mono-400.woff2" => (
+            include_bytes!("../../assets/fonts/jetbrains-mono-400.woff2"),
+            "font/woff2",
+        ),
         "htmx.min.js" => (
             include_bytes!("../../assets/htmx.min.js"),
             "text/javascript",
@@ -130,13 +259,13 @@ pub fn keys_area(rows: &[KeyRow], new_key: Option<&str>) -> Markup {
     html! {
         div id="keys-area" {
             @if let Some(plain) = new_key {
-                div class="panel" {
+                div class="card" {
                     strong { "Key created — copy it now, it will not be shown again:" }
                     div class="keybox" { (plain) }
                 }
             }
-            div class="panel" {
-                table {
+            div class="card" {
+                table class="grid" {
                     thead { tr {
                         th { "Name" } th { "Key" } th { "Models" } th { "Created" }
                         th { "Expires" } th { "Requests" } th { "Status" } th {}
@@ -154,8 +283,8 @@ pub fn keys_area(rows: &[KeyRow], new_key: Option<&str>) -> Markup {
                                 td { @if let Some(e) = k.expires_at { (fmt_ts(e)) } @else { "—" } }
                                 td { (k.n_requests) }
                                 td {
-                                    @if k.revoked_at.is_some() { span class="badge err" { "revoked" } }
-                                    @else { span class="badge ok" { "active" } }
+                                    @if k.revoked_at.is_some() { span class="badge badge-danger" { "revoked" } }
+                                    @else { span class="badge badge-success" { "active" } }
                                 }
                                 td {
                                     @if k.revoked_at.is_none() {
@@ -189,8 +318,8 @@ pub async fn keys_page(State(st): State<AppState>) -> Response {
         Err(e) => return err500(e),
     };
     let body = html! {
-        div class="panel" {
-            h2 style="margin-top:0" { "Create key" }
+        div class="card" {
+            h2 { "Create key" }
             form hx-post="/admin/keys" hx-target="#keys-area" hx-swap="outerHTML" {
                 label { "Name" }
                 input type="text" name="name" required placeholder="my-app";
@@ -201,7 +330,7 @@ pub async fn keys_page(State(st): State<AppState>) -> Response {
                 }
                 label { "Expires after (days, empty = never)" }
                 input type="number" name="expires_days" min="1" placeholder="never";
-                button type="submit" class="primary" style="margin-top:1rem" { "Create key" }
+                button type="submit" class="primary" { "Create key" }
             }
         }
         (keys_area(&rows, None))
@@ -234,18 +363,18 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
     Ok(html! {
         div id="backends-area" {
             @if let Some(n) = notice {
-                div class="panel" { (n) }
+                div class="card" { (n) }
             }
             @for (b, up) in backends.iter().zip(&health) {
-                div class="panel" {
-                    h2 style="margin-top:0" {
+                div class="card" {
+                    h2 {
                         span class=(if *up { "health-dot up" } else { "health-dot down" }) {}
                         (b.name) " "
-                        span class="muted mono" style="font-weight:400;font-size:.8rem" { (b.base_url) }
-                        @if b.is_default { " " span class="badge muted" { "default" } }
-                        @if !b.enabled { " " span class="badge err" { "disabled" } }
+                        span class="muted mono backend-url" { (b.base_url) }
+                        @if b.is_default { " " span class="badge badge-muted" { "default" } }
+                        @if !b.enabled { " " span class="badge badge-danger" { "disabled" } }
                     }
-                    div style="margin-bottom:.6rem" {
+                    div class="row backend-actions" {
                         button hx-post=(format!("/admin/backends/{}/import", b.id))
                             hx-target="#backends-area" hx-swap="outerHTML" { "Import from /models" }
                         " "
@@ -254,7 +383,7 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                                 hx-target="#backends-area" hx-swap="outerHTML" { "Make default" }
                         }
                     }
-                    table {
+                    table class="grid" {
                         thead { tr { th { "Alias (public)" } th { "Upstream name" } th { "Status" } th {} } }
                         tbody {
                             @for m in models.iter().filter(|m| m.backend_id == b.id) {
@@ -263,13 +392,13 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                                         form class="inline" hx-post=(format!("/admin/models/{}/alias", m.id))
                                             hx-target="#backends-area" hx-swap="outerHTML" {
                                             input type="text" name="alias" value=(m.alias)
-                                                style="max-width:220px" title="Edit and press Enter to rename";
+                                                class="alias-input" title="Edit and press Enter to rename";
                                         }
                                     }
                                     td class="mono" { (m.upstream_name) }
                                     td {
-                                        @if m.enabled { span class="badge ok" { "enabled" } }
-                                        @else { span class="badge muted" { "disabled" } }
+                                        @if m.enabled { span class="badge badge-success" { "enabled" } }
+                                        @else { span class="badge badge-muted" { "disabled" } }
                                     }
                                     td {
                                         button hx-post=(format!("/admin/models/{}/toggle", m.id))
@@ -293,8 +422,8 @@ pub async fn backends_page(State(st): State<AppState>) -> Response {
         Err(e) => return err500(e),
     };
     let body = html! {
-        div class="panel" {
-            h2 style="margin-top:0" { "Add backend" }
+        div class="card" {
+            h2 { "Add backend" }
             form hx-post="/admin/backends" hx-target="#backends-area" hx-swap="outerHTML" {
                 label { "Name" }
                 input type="text" name="name" required placeholder="gpu1";
@@ -303,7 +432,7 @@ pub async fn backends_page(State(st): State<AppState>) -> Response {
                 label { "Upstream API key (optional)" }
                 input type="password" name="upstream_api_key";
                 label { input type="checkbox" name="is_default"; " Default backend (for requests without a known model)" }
-                button type="submit" class="primary" style="margin-top:1rem" { "Add backend" }
+                button type="submit" class="primary" { "Add backend" }
             }
         }
         (area)

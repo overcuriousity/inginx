@@ -47,6 +47,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.clone())
         .merge(auth::router(state.clone()))
         .merge(auth::protect(state, protected))
+        // Over the whole admin surface — pages, assets, login, everything —
+        // so the CSP and the frame/referrer/sniff headers are on every
+        // response without a route being able to forget them.
+        .layer(axum::middleware::from_fn(pages::security_headers))
 }
 
 #[cfg(test)]
@@ -59,11 +63,7 @@ mod tests {
 
     async fn logged_in() -> (AppState, Router, String) {
         let db = testdb().await;
-        let st = AppState {
-            log: spawn_writer(db.clone()),
-            db,
-            http: reqwest::Client::new(),
-        };
+        let st = AppState::for_test(db.clone(), spawn_writer(db.clone()), reqwest::Client::new());
         let app = router(st.clone());
         let token = auth::ensure_setup_token(&st.db).await.unwrap().unwrap();
         let setup = axum::http::Request::builder()
@@ -390,12 +390,29 @@ mod tests {
     #[tokio::test]
     async fn assets_served() {
         let (_st, app, _cookie) = logged_in().await;
-        let req = axum::http::Request::builder()
-            .uri("/admin/assets/app.css")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let r = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(r.headers().get(header::CONTENT_TYPE).unwrap(), "text/css");
+        // Every file the layout links, including the fonts: a stylesheet that
+        // names a face nothing serves fails silently, in the one way nobody
+        // notices until the page is in front of someone.
+        for (file, ctype) in [
+            ("app.css", "text/css"),
+            ("app.js", "text/javascript"),
+            ("logo.svg", "image/svg+xml"),
+            ("inter-400.woff2", "font/woff2"),
+            ("inter-500.woff2", "font/woff2"),
+            ("inter-600.woff2", "font/woff2"),
+            ("jetbrains-mono-400.woff2", "font/woff2"),
+        ] {
+            let req = axum::http::Request::builder()
+                .uri(format!("/admin/assets/{file}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let r = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{file}");
+            assert_eq!(
+                r.headers().get(header::CONTENT_TYPE).unwrap(),
+                ctype,
+                "{file}"
+            );
+        }
     }
 }

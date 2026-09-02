@@ -6,4 +6,5 @@ pub mod keys;
 pub mod logstore;
 pub mod metering;
 pub mod proxy;
+pub mod ratelimit;
 pub mod registry;

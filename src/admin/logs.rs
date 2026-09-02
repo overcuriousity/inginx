@@ -120,9 +120,9 @@ async fn fetch_summaries(db: &Db, q: &LogQuery) -> Result<Vec<LogSummary>> {
 
 fn status_badge(status: u16) -> Markup {
     let class = match status {
-        200..=299 => "badge ok",
-        400..=499 => "badge warn",
-        _ => "badge err",
+        200..=299 => "badge badge-success",
+        400..=499 => "badge badge-warning",
+        _ => "badge badge-danger",
     };
     html! { span class=(class) { (status) } }
 }
@@ -194,8 +194,8 @@ pub async fn logs_page(State(st): State<AppState>, Query(q): Query<LogQuery>) ->
             button type="submit" { "Filter" }
             a class="btn" href=(format!("/admin/export?format=native&{}", query_string(&q, 0))) { "Export" }
         }
-        div class="panel" {
-            table {
+        div class="card" {
+            table class="grid" {
                 thead { tr {
                     th { "Time" } th { "Key" } th { "Model" } th { "Endpoint" }
                     th { "Status" } th { "Latency" } th { "Tokens" } th { "Source" }
@@ -203,7 +203,7 @@ pub async fn logs_page(State(st): State<AppState>, Query(q): Query<LogQuery>) ->
                 tbody {
                     @if rows.is_empty() { tr { td colspan="8" class="muted" { "No requests match." } } }
                     @for r in &rows {
-                        tr class="clickable" onclick=(format!("location.href='/admin/logs/{}'", r.id)) {
+                        tr class="clickable" data-href=(format!("/admin/logs/{}", r.id)) {
                             td { (fmt_ts(r.ts)) }
                             td { (r.key_name.clone().unwrap_or_else(|| "—".into())) }
                             td { (r.model.clone().unwrap_or_else(|| "—".into())) }
@@ -212,18 +212,17 @@ pub async fn logs_page(State(st): State<AppState>, Query(q): Query<LogQuery>) ->
                             td { (r.latency_ms) " ms" }
                             td { (r.prompt_tokens) " / " (r.completion_tokens) }
                             td {
-                                @if r.usage_source == "upstream" { span class="badge ok" { "exact" } }
-                                @else { span class="badge warn" { "est." } }
+                                @if r.usage_source == "upstream" { span class="badge badge-success" { "exact" } }
+                                @else { span class="badge badge-warning" { "est." } }
                             }
                         }
                     }
                 }
             }
         }
-        div {
+        div class="row" {
             @if page > 0 {
                 a class="btn" href=(format!("/admin/logs?{}", query_string(&q, page - 1))) { "← Newer" }
-                " "
             }
             @if rows.len() as i64 == PAGE_SIZE {
                 a class="btn" href=(format!("/admin/logs?{}", query_string(&q, page + 1))) { "Older →" }
@@ -362,19 +361,19 @@ pub async fn log_detail(State(st): State<AppState>, Path(id): Path<String>) -> R
             .unwrap_or_else(|_| raw.to_string())
     };
     let body = html! {
-        div class="stats-row" {
-            div class="stat" { div class="num" { (status_badge(status)) } div class="cap" { "status" } }
-            div class="stat" { div class="num" { (latency) " ms" } div class="cap" {
+        div class="measures" {
+            div class="measure" { div class="measure-figure" { (status_badge(status)) } div class="measure-sub" { "status" } }
+            div class="measure" { div class="measure-figure" { (latency) " ms" } div class="measure-sub" {
                 "latency" @if let Some(t) = ttfb { " (TTFB " (t) " ms)" } } }
-            div class="stat" { div class="num" { (pt) " / " (ct) } div class="cap" { "tokens (" (src) ")" } }
-            div class="stat" { div class="num" { (model.clone().unwrap_or_else(|| "—".into())) }
-                div class="cap" { (key_name.clone().unwrap_or_else(|| "—".into())) " · " (fmt_ts(ts)) } }
+            div class="measure" { div class="measure-figure" { (pt) " / " (ct) } div class="measure-sub" { "tokens (" (src) ")" } }
+            div class="measure" { div class="measure-figure" { (model.clone().unwrap_or_else(|| "—".into())) }
+                div class="measure-sub" { (key_name.clone().unwrap_or_else(|| "—".into())) " · " (fmt_ts(ts)) } }
         }
         @if let Some(err) = &error {
-            div class="panel" { span class="badge err" { "error" } " " (err) }
+            div class="card" { span class="badge badge-danger" { "error" } " " (err) }
         }
-        div class="panel" {
-            h2 style="margin-top:0" { span class="mono" { (endpoint) } }
+        div class="card" {
+            h2 { span class="mono" { (endpoint) } }
             h2 { "Request " a class="hint" href=(format!("/admin/logs/{id}/download?part=req")) { "(download)" } }
             (render_payload(&bodies.0, &format!("/admin/logs/{id}/download?part=req")))
             details { summary class="hint" { "Request headers" } pre class="payload" { (pretty_headers(&req_h)) } }

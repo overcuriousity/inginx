@@ -55,6 +55,22 @@ pub async fn add_backend(
 ) -> Result<i64> {
     let name = name.to_string();
     let base_url = base_url.trim_end_matches('/').to_string();
+    // The admin who sets a backend is trusted — the proxy is meant to reach
+    // internal GPU hosts, so we cannot block private addresses without
+    // defeating the point. But a `file://` or a URL carrying credentials is
+    // never a legitimate OpenAI base, and refusing them costs nothing.
+    let lower = base_url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        anyhow::bail!("base_url must be an http(s) URL");
+    }
+    if base_url
+        .split_once("//")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .map(|authority| authority.contains('@'))
+        .unwrap_or(false)
+    {
+        anyhow::bail!("base_url must not embed credentials");
+    }
     db.call(move |c| {
         let tx = c.transaction()?;
         if is_default {

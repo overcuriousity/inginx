@@ -1,14 +1,18 @@
 use crate::db::{now, Db};
+use crate::keys::ApiKey;
 use crate::logstore::{LogRecord, LogWriter};
+use crate::ratelimit::LoginThrottle;
 use crate::{keys, metering, registry};
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Extension, Request, State},
     http::{header, HeaderMap, Method, StatusCode, Uri},
+    middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
     routing::{any, get},
     Json, Router,
 };
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone)]
@@ -16,14 +20,80 @@ pub struct AppState {
     pub db: Db,
     pub log: LogWriter,
     pub http: reqwest::Client,
+    pub login_throttle: Arc<LoginThrottle>,
+    /// Largest request body the proxy will buffer. Carried on the state so the
+    /// admin router, which shares the state, can leave its own small default
+    /// in place — this ceiling is for the proxy alone.
+    pub max_body_bytes: usize,
+    /// Whether to believe `X-Real-IP` / `X-Forwarded-For` / `X-Forwarded-Proto`
+    /// from a fronting reverse proxy. See `config::Config::trust_proxy_headers`.
+    pub trust_proxy_headers: bool,
+}
+
+impl AppState {
+    /// Builds an `AppState` with the security knobs at their production
+    /// defaults, so a test names only the three things it varies. Not behind
+    /// `#[cfg(test)]` because the integration tests are a separate crate.
+    #[doc(hidden)]
+    pub fn for_test(db: Db, log: LogWriter, http: reqwest::Client) -> Self {
+        Self {
+            db,
+            log,
+            http,
+            login_throttle: Arc::new(LoginThrottle::new(5, std::time::Duration::from_secs(300))),
+            max_body_bytes: 32 * 1024 * 1024,
+            trust_proxy_headers: false,
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
+    let limit = state.max_body_bytes;
     Router::new()
         .route("/v1/models", get(models_handler))
         .route("/v1/{*path}", any(proxy_handler))
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        // The order matters. `from_fn` middleware runs before the handler's
+        // own extractors, so the key is checked while the request body is
+        // still a stream on the wire — an unauthenticated caller is turned
+        // away before a single byte of a body is buffered. The body limit is
+        // the backstop for everyone who *is* authenticated.
+        .layer(from_fn_with_state(state.clone(), require_api_key))
+        .layer(DefaultBodyLimit::max(limit))
         .with_state(state)
+}
+
+/// Pulls the bearer token, authenticates it, and stashes the resolved key for
+/// the handler — all before the body is read. A miss returns the OpenAI-shaped
+/// 401 here rather than deep in a handler that would first have paid to buffer
+/// the body. See the note in `router` for why this is a layer and not a step
+/// inside `proxy_handler`.
+async fn require_api_key(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
+    let Some(token) = bearer(req.headers()) else {
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "Missing API key",
+            "invalid_api_key",
+        );
+    };
+    match keys::authenticate(&st.db, token).await {
+        Ok(Some(key)) => {
+            req.extensions_mut().insert(key);
+            next.run(req).await
+        }
+        Ok(None) => openai_error(
+            StatusCode::UNAUTHORIZED,
+            "Invalid API key",
+            "invalid_api_key",
+        ),
+        Err(e) => {
+            tracing::error!("auth failure: {e}");
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+                "internal",
+            )
+        }
+    }
 }
 
 pub fn openai_error(status: StatusCode, msg: &str, code: &str) -> Response {
@@ -49,13 +119,38 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// Serializes headers as a JSON object, redacting the authorization value.
+/// True for a header whose value is a secret we must never write to the log
+/// store. `Authorization` was the only name redacted before, on the
+/// assumption that it is the only place a credential rides — but a client can
+/// authenticate to an upstream with `X-Api-Key`, carry a session in `Cookie`,
+/// or invent a header for a token, and every one of those was landing in the
+/// database in cleartext and rendering in the log viewer. Match by shape
+/// rather than by an exhaustive list: any name that says key, token, secret,
+/// auth, cookie, session or password is redacted, which catches the vendor
+/// headers we have not thought of as well as the ones we have.
+fn is_sensitive_header(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    const NEEDLES: [&str; 8] = [
+        "authorization",
+        "cookie",
+        "key",
+        "token",
+        "secret",
+        "auth",
+        "session",
+        "password",
+    ];
+    NEEDLES.iter().any(|needle| n.contains(needle))
+}
+
+/// Serializes headers as a JSON object, redacting the value of any header that
+/// looks like it carries a credential. See `is_sensitive_header`.
 fn headers_json(headers: &HeaderMap) -> String {
     let map: serde_json::Map<String, serde_json::Value> = headers
         .iter()
         .map(|(k, v)| {
-            let val = if k == header::AUTHORIZATION {
-                "Bearer igx_***redacted***".to_string()
+            let val = if is_sensitive_header(k.as_str()) {
+                "***redacted***".to_string()
             } else {
                 v.to_str().unwrap_or("<binary>").to_string()
             };
@@ -69,41 +164,21 @@ fn resp_headers_json(headers: &reqwest::header::HeaderMap) -> String {
     let map: serde_json::Map<String, serde_json::Value> = headers
         .iter()
         .map(|(k, v)| {
-            (
-                k.to_string(),
-                serde_json::Value::String(v.to_str().unwrap_or("<binary>").to_string()),
-            )
+            // An upstream's `Set-Cookie` is as much a credential as the
+            // request's `Authorization`; redact the response side by the same
+            // rule.
+            let val = if is_sensitive_header(k.as_str()) {
+                "***redacted***".to_string()
+            } else {
+                v.to_str().unwrap_or("<binary>").to_string()
+            };
+            (k.to_string(), serde_json::Value::String(val))
         })
         .collect();
     serde_json::Value::Object(map).to_string()
 }
 
-async fn models_handler(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(token) = bearer(&headers) else {
-        return openai_error(
-            StatusCode::UNAUTHORIZED,
-            "Missing API key",
-            "invalid_api_key",
-        );
-    };
-    let key = match keys::authenticate(&st.db, token).await {
-        Ok(Some(k)) => k,
-        Ok(None) => {
-            return openai_error(
-                StatusCode::UNAUTHORIZED,
-                "Invalid API key",
-                "invalid_api_key",
-            )
-        }
-        Err(e) => {
-            tracing::error!("auth failure: {e}");
-            return openai_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error",
-                "internal",
-            );
-        }
-    };
+async fn models_handler(State(st): State<AppState>, Extension(key): Extension<ApiKey>) -> Response {
     match registry::models_for_key(&st.db, &key).await {
         Ok(models) => Json(serde_json::json!({
             "object": "list",
@@ -143,6 +218,7 @@ fn extract_model(body: &[u8], content_type: &str) -> Option<String> {
 
 pub async fn proxy_handler(
     State(st): State<AppState>,
+    Extension(key): Extension<ApiKey>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -151,32 +227,8 @@ pub async fn proxy_handler(
     let endpoint = uri.path().to_string();
     let started = Instant::now();
 
-    // 1. Authenticate
-    let Some(token) = bearer(&headers) else {
-        return openai_error(
-            StatusCode::UNAUTHORIZED,
-            "Missing API key",
-            "invalid_api_key",
-        );
-    };
-    let key = match keys::authenticate(&st.db, token).await {
-        Ok(Some(k)) => k,
-        Ok(None) => {
-            return openai_error(
-                StatusCode::UNAUTHORIZED,
-                "Invalid API key",
-                "invalid_api_key",
-            )
-        }
-        Err(e) => {
-            tracing::error!("auth failure: {e}");
-            return openai_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error",
-                "internal",
-            );
-        }
-    };
+    // 1. Authenticate — done in `require_api_key` before the body was read;
+    //    the resolved key arrives as an extension.
 
     // 2. Resolve model -> backend
     let content_type = headers
@@ -611,6 +663,34 @@ mod tests {
             Some("m1".into())
         );
         assert_eq!(extract_model(b"junk", "application/json"), None);
+    }
+
+    #[test]
+    fn sensitive_headers_are_redacted() {
+        for name in [
+            "authorization",
+            "Authorization",
+            "Cookie",
+            "X-Api-Key",
+            "x-secret-token",
+            "proxy-authorization",
+            "x-session-id",
+        ] {
+            assert!(is_sensitive_header(name), "{name} should be redacted");
+        }
+        for name in ["content-type", "accept", "user-agent", "x-request-id"] {
+            assert!(!is_sensitive_header(name), "{name} should be kept");
+        }
+
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, "Bearer igx_secret".parse().unwrap());
+        h.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        h.insert("x-api-key", "sk-live-123".parse().unwrap());
+        let json = headers_json(&h);
+        assert!(!json.contains("igx_secret"), "auth value leaked: {json}");
+        assert!(!json.contains("sk-live-123"), "api key leaked: {json}");
+        assert!(json.contains("***redacted***"));
+        assert!(json.contains("application/json"), "safe header dropped");
     }
 
     #[test]

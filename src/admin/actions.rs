@@ -95,6 +95,29 @@ pub async fn add_backend(State(st): State<AppState>, RawForm(body): RawForm) -> 
         )
             .into_response();
     }
+    // A bad URL is the operator mistyping, not the server failing — answer it
+    // as the client error it is. `registry::add_backend` re-checks the same
+    // rules as a backstop for any other caller.
+    let lower = base_url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "base_url must be an http(s) URL",
+        )
+            .into_response();
+    }
+    let has_userinfo = base_url
+        .split_once("//")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .map(|authority| authority.contains('@'))
+        .unwrap_or(false);
+    if has_userinfo {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "base_url must not embed credentials",
+        )
+            .into_response();
+    }
     let is_default = fields.iter().any(|(k, _)| k == "is_default");
     let key = (!api_key.is_empty()).then_some(api_key);
     match registry::add_backend(&st.db, &name, &base_url, key, is_default).await {

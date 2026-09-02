@@ -1,113 +1,433 @@
+/* inginx admin — the Vestigo/engram house style.
+
+   Palette, geometry and type are ported from Vestigo (frontend/src/index.css)
+   by way of engram (assets/css/00-tokens.css), converted from Tailwind
+   `@theme` to plain custom properties. Three products, one identity: warm
+   paper in light, cool slate in dark, a muted blue that becomes a muted teal,
+   3px and 6px corners, Inter over JetBrains Mono.
+
+   One file rather than engram's numbered layers, because the admin is five
+   pages and a login — but in the same order the layers sort, so a rule is
+   where the cascade expects it: tokens, base, layout, components, pages. */
+
+/* ── Tokens ──────────────────────────────────────────────────────────────── */
+
+@font-face { font-family: Inter; font-weight: 400; font-display: swap;
+  src: url("/admin/assets/inter-400.woff2") format("woff2"); }
+@font-face { font-family: Inter; font-weight: 500; font-display: swap;
+  src: url("/admin/assets/inter-500.woff2") format("woff2"); }
+@font-face { font-family: Inter; font-weight: 600; font-display: swap;
+  src: url("/admin/assets/inter-600.woff2") format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; font-weight: 400; font-display: swap;
+  src: url("/admin/assets/jetbrains-mono-400.woff2") format("woff2"); }
+
 :root {
-  color-scheme: dark;
-  --bg: #0d1117;
-  --panel: #161b22;
-  --border: #30363d;
-  --text: #e6edf3;
-  --muted: #8b949e;
-  --accent: #2f81f7;
-  --accent-hover: #1f6feb;
-  --ok: #3fb950;
-  --warn: #d29922;
-  --err: #f85149;
-  --radius: 10px;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-md: 0.9375rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+
+  --color-bg-base: #f8f6f1;
+  --color-bg-surface: #f2f0ea;
+  --color-bg-elevated: #ffffff;
+  --color-bg-hover: #ece9e2;
+  --color-bg-active: #e2ded3;
+
+  --color-fg-primary: #2d2d2d;
+  --color-fg-secondary: #5a5a5a;
+  --color-fg-muted: #7a7a72;
+
+  --color-border: #ddd8cc;
+  --color-border-strong: #c9c3b4;
+  --color-border-subtle: #eae7de;
+
+  --color-accent: #3b6e91;
+  --color-accent-dim: rgba(59, 110, 145, 0.1);
+  --color-accent-muted: rgba(59, 110, 145, 0.25);
+  --color-accent-fg: #ffffff;
+
+  --color-danger: #b3382c;  --color-danger-dim: rgba(179, 56, 44, 0.1);
+  --color-warning: #9a6a1a; --color-warning-dim: rgba(154, 106, 26, 0.1);
+  --color-success: #2f7a4f; --color-success-dim: rgba(47, 122, 79, 0.1);
+
+  /* The categorical series palette, in fixed order and CVD-validated. The
+     charts assign by index and never reassign when a filter changes the
+     series count — the same rule Vestigo's visualizations follow. */
+  --viz-series-1: #2a78d6;
+  --viz-series-2: #1baf7a;
+  --viz-series-3: #eda100;
+  --viz-series-6: #e34948;
+
+  color-scheme: light;
 }
-* { box-sizing: border-box; }
+
+/* Three states, two selectors. The system preference applies unless an
+   explicit light choice says otherwise; an explicit dark choice applies
+   whatever the system says. Light needs no block of its own — it is already on
+   bare `:root`, and `[data-theme="light"]` wins by excluding itself from the
+   media query. The declarations are written twice because CSS cannot give one
+   block two conditions; the two are adjacent so they change together. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg-base: #0e1015;
+    --color-bg-surface: #14171d;
+    --color-bg-elevated: #1b1e26;
+    --color-bg-hover: #262a34;
+    --color-bg-active: #2d3140;
+
+    --color-fg-primary: #e2e4ec;
+    --color-fg-secondary: #8b8fa8;
+    --color-fg-muted: #7d82a0;
+
+    --color-border: #232636;
+    --color-border-strong: #2e3244;
+    --color-border-subtle: #191c26;
+
+    --color-accent: #5aa8b0;
+    --color-accent-dim: rgba(90, 168, 176, 0.15);
+    --color-accent-muted: rgba(90, 168, 176, 0.35);
+    --color-accent-fg: #0e1015;
+
+    --color-danger: #e05252;  --color-danger-dim: rgba(224, 82, 82, 0.15);
+    --color-warning: #e8a839; --color-warning-dim: rgba(232, 168, 57, 0.15);
+    --color-success: #4caf7d; --color-success-dim: rgba(76, 175, 125, 0.15);
+
+    --viz-series-1: #3987e5;
+    --viz-series-2: #199e70;
+    --viz-series-3: #c98500;
+    --viz-series-6: #e66767;
+
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+    --color-bg-base: #0e1015;
+    --color-bg-surface: #14171d;
+    --color-bg-elevated: #1b1e26;
+    --color-bg-hover: #262a34;
+    --color-bg-active: #2d3140;
+
+    --color-fg-primary: #e2e4ec;
+    --color-fg-secondary: #8b8fa8;
+    --color-fg-muted: #7d82a0;
+
+    --color-border: #232636;
+    --color-border-strong: #2e3244;
+    --color-border-subtle: #191c26;
+
+    --color-accent: #5aa8b0;
+    --color-accent-dim: rgba(90, 168, 176, 0.15);
+    --color-accent-muted: rgba(90, 168, 176, 0.35);
+    --color-accent-fg: #0e1015;
+
+    --color-danger: #e05252;  --color-danger-dim: rgba(224, 82, 82, 0.15);
+    --color-warning: #e8a839; --color-warning-dim: rgba(232, 168, 57, 0.15);
+    --color-success: #4caf7d; --color-success-dim: rgba(76, 175, 125, 0.15);
+
+    --viz-series-1: #3987e5;
+    --viz-series-2: #199e70;
+    --viz-series-3: #c98500;
+    --viz-series-6: #e66767;
+
+    color-scheme: dark;
+}
+
+/* ── Base ────────────────────────────────────────────────────────────────── */
+
+*, *::before, *::after { box-sizing: border-box; }
+html { font-size: 16px; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
 body {
-  margin: 0; background: var(--bg); color: var(--text);
-  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-  display: flex; min-height: 100vh;
+  margin: 0; background: var(--color-bg-base); color: var(--color-fg-primary);
+  font-family: var(--font-sans); font-size: var(--text-base); line-height: 1.5;
 }
-a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
+a { color: var(--color-accent); }
+.mono, code, pre { font-family: var(--font-mono); }
 
-nav.sidebar {
-  width: 210px; flex-shrink: 0; background: var(--panel);
-  border-right: 1px solid var(--border); padding: 1.2rem .8rem;
-  display: flex; flex-direction: column; gap: .15rem;
-}
-nav.sidebar .brand {
-  font-weight: 700; font-size: 1.15rem; padding: .3rem .6rem 1rem;
-  letter-spacing: .02em;
-}
-nav.sidebar .brand span { color: var(--accent); }
-nav.sidebar a {
-  display: block; padding: .45rem .6rem; border-radius: 8px;
-  color: var(--muted); font-weight: 500;
-}
-nav.sidebar a:hover { background: #21262d; color: var(--text); text-decoration: none; }
-nav.sidebar a.active { background: #21262d; color: var(--text); }
-nav.sidebar .spacer { flex: 1; }
+h1 { font-size: var(--text-2xl); font-weight: 600; letter-spacing: -0.02em; margin: 0 0 1rem; }
+h2 { font-size: var(--text-xl); font-weight: 600; letter-spacing: -0.01em; margin: 1.75rem 0 0.5rem; }
+h3 { font-size: var(--text-lg); font-weight: 600; margin: 1.5rem 0 0.375rem; }
+/* A card's own heading opens the card; the margin belongs between two of them,
+   not above the first. Written here rather than as `style="margin-top:0"` on
+   every second heading in the templates. */
+.card > h2:first-child, .card > h3:first-child { margin-top: 0; }
 
-main {
-  flex: 1; padding: 1.6rem 2rem; max-width: 1200px; min-width: 0;
-}
-h1 { font-size: 1.35rem; margin: 0 0 1.2rem; }
-h2 { font-size: 1.05rem; margin: 1.6rem 0 .7rem; }
-
-.panel {
-  background: var(--panel); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 1rem 1.2rem; margin-bottom: 1.2rem;
+.label {
+  font-size: var(--text-xs); color: var(--color-fg-muted);
+  text-transform: uppercase; letter-spacing: 0.04em;
 }
 
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--border); }
-th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
-tr:last-child td { border-bottom: 0; }
-tr.clickable { cursor: pointer; }
-tr.clickable:hover td { background: #1c2129; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border-strong); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-fg-muted); }
 
-.badge {
-  display: inline-block; padding: .1rem .5rem; border-radius: 999px;
-  font-size: .75rem; font-weight: 600;
+:focus-visible { outline: 1.5px solid var(--color-accent); outline-offset: 2px; }
+::selection { background: var(--color-accent-dim); }
+
+/* A measure for prose. The tables want the whole window and the sentences
+   above them do not; only the sentences are constrained. */
+.prose, .regions-focus p { max-width: 68ch; }
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
+
+/* Full-bleed, so the rule under the header runs the width of the window rather
+   than stopping at whatever measure the page below happens to use. */
+.topbar { border-bottom: 1px solid var(--color-border); margin-bottom: 1.5rem; }
+nav.top {
+  display: flex; gap: 0.25rem; align-items: center;
+  max-width: 110rem; margin: 0 auto; padding: 0.75rem 1rem;
 }
-.badge.ok { background: rgba(63,185,80,.15); color: var(--ok); }
-.badge.warn { background: rgba(210,153,34,.15); color: var(--warn); }
-.badge.err { background: rgba(248,81,73,.15); color: var(--err); }
-.badge.muted { background: #21262d; color: var(--muted); }
+nav.top a {
+  color: var(--color-fg-secondary); text-decoration: none;
+  padding: 0.375rem 0.75rem; border-radius: var(--radius-sm); font-size: var(--text-base);
+  transition: background 120ms ease, color 120ms ease;
+}
+nav.top a:hover { background: var(--color-bg-hover); color: var(--color-fg-primary); }
+nav.top a[aria-current="page"] { color: var(--color-fg-primary); background: var(--color-bg-active); }
+.spacer { flex: 1; }
 
+/* The mark is one colour and takes it from the text beside it, so it follows
+   the theme — including a `data-theme` override, which an <img> could not see.
+   Sizing lives on the parent because the same SVG is used at two sizes. */
+nav.top a.brand {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  font-weight: 600; color: var(--color-fg-primary);
+  padding-left: 0; margin-right: 0.5rem;
+}
+nav.top a.brand:hover { background: transparent; }
+.mark { display: block; flex: none; color: inherit; }
+nav.top a.brand .mark { width: 22px; height: 22px; }
+.brand-lockup { display: flex; align-items: center; gap: 0.55rem; margin-bottom: 1rem; }
+.brand-lockup .mark { width: 40px; height: 40px; }
+.brand-name { font-size: var(--text-xl); font-weight: 600; letter-spacing: -0.02em; }
+
+.shell { max-width: 110rem; margin: 0 auto; padding: 0 1rem 4rem; }
+
+/* A page says which regions it uses; it never says how wide it is. Both start
+   at the shell's left edge, so the content column does not move under a brand
+   that stays put. Prose is the measure for the pages that are sentences and
+   forms; a table has no measure — it is as wide as its columns need. */
+.regions { display: grid; gap: 1rem; align-items: start; }
+.regions > * { min-width: 0; }
+.regions-focus { grid-template-columns: minmax(0, 68rem); }
+.regions-table { grid-template-columns: minmax(0, 1fr); }
+/* One column, centred in the window rather than anchored to its left edge:
+   for the pages that are not part of the admin and have nothing to line up
+   with — signing in, the second factor, creating the account. */
+.regions-center { grid-template-columns: minmax(0, 26rem); justify-content: center; min-height: 80vh; align-content: center; }
+.regions > * { grid-column: 1 / -1; }
+
+/* Navigating between two pages that share this grid should look like the
+   content changing, not like the window being replaced. */
+@view-transition { navigation: auto; }
+@media (prefers-reduced-motion: no-preference) {
+  ::view-transition-group(*) { animation-duration: 180ms; }
+  .topbar { view-transition-name: topbar; }
+}
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) { animation: none !important; }
+}
+
+/* ── Components ──────────────────────────────────────────────────────────── */
+
+/* The element and the class, together. Vestigo and engram spell every control
+   out in classes because their markup is written by hand in JSX and Jinja;
+   this admin's markup is generated by maud and has one kind of button and one
+   kind of field, so the bare elements carry the style and the classes only
+   name the variants. Same result on screen, far less to remember when adding
+   a form. */
 button, .btn {
-  padding: .4rem .9rem; border-radius: 8px; border: 1px solid var(--border);
-  background: #21262d; color: var(--text); font-size: .85rem; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.375rem;
+  height: 36px; padding: 0 0.875rem; font-size: var(--text-base); font-weight: 500;
+  border-radius: var(--radius-sm); cursor: pointer; white-space: nowrap;
+  background: var(--color-bg-active); color: var(--color-fg-primary);
+  border: 1px solid var(--color-border-strong); font-family: inherit;
+  text-decoration: none;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
 }
-button:hover, .btn:hover { border-color: var(--muted); }
-button.primary { background: var(--accent); border-color: transparent; color: #fff; }
-button.primary:hover { background: var(--accent-hover); }
-button.danger { color: var(--err); }
-button.danger:hover { border-color: var(--err); }
+button:hover, .btn:hover { background: var(--color-bg-hover); }
+button:disabled, .btn:disabled { opacity: 0.4; pointer-events: none; }
+button.primary, .btn-accent {
+  background: var(--color-accent); color: var(--color-accent-fg);
+  font-weight: 600; border-color: transparent;
+}
+button.primary:hover, .btn-accent:hover { opacity: 0.9; background: var(--color-accent); }
+button.ghost, .btn-ghost { background: transparent; border-color: transparent; color: var(--color-fg-secondary); }
+button.ghost:hover, .btn-ghost:hover { background: var(--color-bg-hover); color: var(--color-fg-primary); }
+button.danger, .btn-danger {
+  background: var(--color-danger-dim); color: var(--color-danger); border-color: var(--color-danger);
+}
+button.danger:hover, .btn-danger:hover { background: var(--color-danger); color: #fff; }
+.btn-sm { height: 32px; padding: 0 0.75rem; font-size: var(--text-xs); }
 
-label { display: block; margin: .7rem 0 .2rem; color: var(--muted); font-size: .82rem; }
-input, select {
-  width: 100%; max-width: 420px; padding: .45rem .6rem; border-radius: 8px;
-  border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: .95rem;
+input, select, textarea, .input {
+  width: 100%; max-width: 26rem; font-size: var(--text-base); font-family: inherit;
+  color: var(--color-fg-primary); background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong); border-radius: var(--radius-sm);
+  height: 36px; padding: 0 0.75rem; transition: border-color 120ms ease;
 }
-input[type="checkbox"] { width: auto; }
+select[multiple], textarea { height: auto; padding: 0.5rem 0.75rem; }
+input::placeholder, textarea::placeholder { color: var(--color-fg-muted); }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--color-accent); }
+/* A checkbox is not a field: it is a mark beside a sentence, and the field
+   rules above turned every one of them into a 26rem-wide box. */
+input[type="checkbox"], input[type="radio"] {
+  width: auto; height: auto; margin: 0 0.4rem 0 0; padding: 0; accent-color: var(--color-accent);
+}
+label {
+  display: block; margin: 0.75rem 0 0.25rem;
+  font-size: var(--text-xs); color: var(--color-fg-muted);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+/* The label around a checkbox is the sentence, not the caption above it. */
+label:has(> input[type="checkbox"]) {
+  display: flex; align-items: center; text-transform: none; letter-spacing: 0;
+  font-size: var(--text-base); color: var(--color-fg-primary);
+}
 form.inline { display: inline; }
+/* The action at the end of a form gets air above it, so the form does not read
+   as one more field. Written once here rather than as an inline margin on
+   every submit button in the templates. */
+form > button, form > .btn { margin-top: 1rem; }
+/* Except in a filter row, where the button is one control beside the others
+   and is aligned to their baseline. */
+.filters > button, .filters > .btn { margin-top: 0; }
+/* And not in the top row, where "Sign out" is a form of one button and the
+   air above it would drop the button out of the row. */
+nav.top form > button { margin-top: 0; }
 
-.keybox {
-  background: var(--bg); border: 1px dashed var(--accent); border-radius: 8px;
-  padding: .8rem 1rem; font-family: ui-monospace, monospace; font-size: .95rem;
-  margin: .8rem 0; word-break: break-all;
+.card {
+  background: var(--color-bg-elevated); border: 1px solid var(--color-border);
+  border-radius: var(--radius-md); padding: 1rem 1.25rem; margin-bottom: 1rem;
 }
-.hint { color: var(--muted); font-size: .82rem; }
+
+/* `nowrap`, because a badge is a label rather than a paragraph: a two-word
+   status broke across two lines inside its own border and made every table row
+   a different height. */
+.badge {
+  display: inline-flex; align-items: center; padding: 2px 6px;
+  font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.2;
+  border-radius: var(--radius-sm); white-space: nowrap;
+  background: var(--color-bg-active); color: var(--color-fg-secondary);
+  border: 1px solid var(--color-border-strong);
+}
+.badge-accent  { background: var(--color-accent-dim);  color: var(--color-accent);  border-color: var(--color-accent-muted); }
+.badge-success { background: var(--color-success-dim); color: var(--color-success); border-color: var(--color-success); }
+.badge-warning { background: var(--color-warning-dim); color: var(--color-warning); border-color: var(--color-warning); }
+.badge-danger  { background: var(--color-danger-dim);  color: var(--color-danger);  border-color: var(--color-danger); }
+.badge-muted   { background: var(--color-bg-elevated); color: var(--color-fg-muted); border-color: var(--color-border-subtle); }
+
+table.grid { width: 100%; border-collapse: collapse; font-size: var(--text-base); }
+table.grid th {
+  text-align: left; font-weight: 500; font-size: var(--text-xs);
+  color: var(--color-fg-muted); text-transform: uppercase; letter-spacing: 0.03em;
+  padding: 0 12px 8px; border-bottom: 1px solid var(--color-border);
+}
+table.grid td { padding: 8px 12px; border-bottom: 1px solid var(--color-border-subtle); height: 42px; }
+table.grid tbody tr:last-child td { border-bottom: 0; }
+table.grid tbody tr:hover td { background: var(--color-bg-hover); }
+table.grid tr.clickable { cursor: pointer; }
+/* A cell holding a control takes the width of the control and stops. `1%` with
+   `nowrap` is the way a table is told that — any larger share and the browser
+   spends the slack on it. */
+table.grid td:last-child:has(button), table.grid td:last-child:has(form) { width: 1%; white-space: nowrap; }
+/* Wide content scrolls in its own box rather than dragging the page sideways. */
+.regions-table .card:has(> table.grid) { overflow-x: auto; }
+/* A form is not a table and has no business being 110rem wide: the fields are
+   26rem and the rest was empty card. Only the top-level ones — the card that
+   creates a key or adds a backend — because the forms further down are single
+   controls living inside a table cell. */
+.regions-table > .card:has(> form) { max-width: 42rem; }
+
+.muted { color: var(--color-fg-muted); }
+/* A line of guidance under the thing it belongs to: smaller than the heading
+   it follows, and close enough to read as part of the same block. */
+.hint { margin: 0.375rem 0 0; font-size: var(--text-sm); line-height: 1.45; color: var(--color-fg-secondary); }
+.err { color: var(--color-danger); font-size: var(--text-sm); margin: 0.75rem 0 0; }
+.row { display: flex; gap: 0.5rem; align-items: center; }
+.stack { display: flex; flex-direction: column; gap: 0.75rem; }
+
+/* ── Pages ───────────────────────────────────────────────────────────────── */
+
+/* The measures: panels that each answer one question, so they sit beside each
+   other rather than stacking. `auto-fit`, because at a narrow window two is
+   better than four squeezed. */
+.measures {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 1rem; margin-bottom: 1.5rem;
+}
+.measure {
+  background: var(--color-bg-elevated); border: 1px solid var(--color-border);
+  border-radius: var(--radius-md); padding: 0.875rem 1rem;
+}
+/* Mono, because a proportional face makes two measurements the same width by
+   accident and these are meant to be compared across the row. */
+.measure-figure {
+  font-family: var(--font-mono); font-size: var(--text-2xl);
+  line-height: 1.1; margin: 0 0 0.25rem; color: var(--color-fg-primary);
+  overflow: hidden; text-overflow: ellipsis;
+}
+.measure-sub { font-size: var(--text-xs); color: var(--color-fg-muted); margin: 0.125rem 0 0; }
+
+/* Two panels of the same kind, side by side until they no longer fit. */
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 1rem; }
+
+.filters {
+  display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: end; margin-bottom: 1rem;
+}
+.filters label { margin: 0 0 0.25rem; }
+.filters input, .filters select { max-width: 11rem; }
+
+.health-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 0.45rem; vertical-align: middle;
+}
+.health-dot.up { background: var(--color-success); }
+.health-dot.down { background: var(--color-danger); }
+
+/* The upstream URL beside a backend's name: quieter and lighter than the name,
+   a caption rather than a second title. Was an inline style until the CSP
+   dropped `style-src` to `'self'`. */
+.backend-url { font-weight: 400; font-size: var(--text-sm); }
+/* The row of backend actions sits just above its model table. */
+.backend-actions { margin-bottom: 0.6rem; }
+/* The inline alias editor is one field in a table cell, not a page-width form;
+   it takes the width of a model name and stops. */
+.alias-input { max-width: 220px; }
+
+/* Shown once and never again, so it is drawn as something to copy rather than
+   as another line of the page: the dashed accent border is the only one in the
+   admin, and it means "this is the moment". */
+.keybox {
+  background: var(--color-bg-surface); border: 1px dashed var(--color-accent);
+  border-radius: var(--radius-sm); padding: 0.75rem 0.875rem;
+  font-family: var(--font-mono); font-size: var(--text-md);
+  margin: 0.625rem 0 0; word-break: break-all; color: var(--color-fg-primary);
+}
 
 pre.payload {
-  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-  padding: .9rem 1rem; overflow-x: auto; font-size: .82rem; max-height: 480px;
+  background: var(--color-bg-surface); border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm); padding: 0.625rem 0.75rem;
+  overflow-x: auto; font-size: var(--text-sm); max-height: 30rem;
 }
-.stats-row { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.2rem; }
-.stat {
-  flex: 1; min-width: 150px; background: var(--panel); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: .9rem 1.1rem;
-}
-.stat .num { font-size: 1.5rem; font-weight: 700; }
-.stat .cap { color: var(--muted); font-size: .8rem; }
-.health-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: .45rem; }
-.health-dot.up { background: var(--ok); }
-.health-dot.down { background: var(--err); }
-.filters { display: flex; gap: .6rem; flex-wrap: wrap; align-items: end; margin-bottom: 1rem; }
-.filters label { margin: 0 0 .2rem; }
-.filters input, .filters select { max-width: 170px; }
-.chart-wrap { margin-top: .6rem; }
-.muted { color: var(--muted); }
-.mono { font-family: ui-monospace, monospace; }
+details > summary { cursor: pointer; color: var(--color-fg-secondary); }
+details > summary::marker { color: var(--color-fg-muted); }
+
+/* uPlot draws its own chrome. Everything it can be told in CSS is told here,
+   so the series colours are the only thing the script has to know. */
+.chart-wrap { margin-top: 0.5rem; }
+.u-title { font-size: var(--text-sm) !important; color: var(--color-fg-secondary); }
+.u-legend { font-size: var(--text-xs) !important; font-family: var(--font-mono); }
+.u-legend th, .u-legend td { font-weight: 400 !important; }

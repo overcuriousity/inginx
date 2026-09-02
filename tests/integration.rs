@@ -87,11 +87,11 @@ async fn setup() -> Ctx {
         .await
         .unwrap();
     let key = keys::create(&db, "test", true, &[], None).await.unwrap();
-    let state = proxy::AppState {
-        db: db.clone(),
-        log: logstore::spawn_writer(db.clone()),
-        http: reqwest::Client::new(),
-    };
+    let state = proxy::AppState::for_test(
+        db.clone(),
+        logstore::spawn_writer(db.clone()),
+        reqwest::Client::new(),
+    );
     let inginx = spawn_app(proxy::router(state)).await;
     Ctx { db, inginx, key }
 }
@@ -331,11 +331,11 @@ async fn unreachable_backend_502_openai_shape() {
         .await
         .unwrap();
     let key = keys::create(&db, "k", true, &[], None).await.unwrap();
-    let state = proxy::AppState {
-        db: db.clone(),
-        log: logstore::spawn_writer(db.clone()),
-        http: reqwest::Client::new(),
-    };
+    let state = proxy::AppState::for_test(
+        db.clone(),
+        logstore::spawn_writer(db.clone()),
+        reqwest::Client::new(),
+    );
     let inginx = spawn_app(proxy::router(state)).await;
 
     let resp = reqwest::Client::new()
@@ -361,11 +361,11 @@ async fn merged_listener_serves_api_and_admin() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("t.db")).unwrap();
     std::mem::forget(dir);
-    let state = proxy::AppState {
-        db: db.clone(),
-        log: logstore::spawn_writer(db.clone()),
-        http: reqwest::Client::new(),
-    };
+    let state = proxy::AppState::for_test(
+        db.clone(),
+        logstore::spawn_writer(db.clone()),
+        reqwest::Client::new(),
+    );
     let app = proxy::router(state.clone()).merge(inginx::admin::router(state));
     let addr = spawn_app(app).await;
     let client = reqwest::Client::new();

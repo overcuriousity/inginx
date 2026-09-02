@@ -9,7 +9,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     Form,
 };
-use maud::{html, PreEscaped};
+use maud::html;
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -119,39 +119,39 @@ pub async fn dashboard(State(st): State<AppState>) -> Response {
         health.push(backend_up(&st.http, b).await);
     }
     let body = html! {
-        div class="stats-row" {
-            div class="stat" { div class="num" { (req_24) } div class="cap" { "requests (24h)" } }
-            div class="stat" { div class="num" { (tok_24) } div class="cap" { "tokens (24h)" } }
-            div class="stat" { div class="num" { (err_24) } div class="cap" { "errors (24h)" } }
-            div class="stat" {
-                div class="num" {
+        div class="measures" {
+            div class="measure" { div class="measure-figure" { (req_24) } div class="measure-sub" { "requests (24h)" } }
+            div class="measure" { div class="measure-figure" { (tok_24) } div class="measure-sub" { "tokens (24h)" } }
+            div class="measure" { div class="measure-figure" { (err_24) } div class="measure-sub" { "errors (24h)" } }
+            div class="measure" {
+                div class="measure-figure" {
                     @for (b, up) in backends.iter().zip(&health) {
                         span class=(if *up { "health-dot up" } else { "health-dot down" }) title=(b.name) {}
                     }
                     @if backends.is_empty() { "—" }
                 }
-                div class="cap" { "backends" }
+                div class="measure-sub" { "backends" }
             }
         }
-        div class="panel" {
-            h2 style="margin-top:0" { "Requests per hour (7d)" }
+        div class="card" {
+            h2 { "Requests per hour (7d)" }
             div class="chart-wrap" { div id="chart-req" {} }
             h2 { "Tokens per hour (7d)" }
             div class="chart-wrap" { div id="chart-tok" {} }
         }
-        div style="display:flex; gap:1.2rem; flex-wrap:wrap" {
-            div class="panel" style="flex:1; min-width:300px" {
-                h2 style="margin-top:0" { "Top models (7d)" }
-                table {
+        div class="pair" {
+            div class="card" {
+                h2 { "Top models (7d)" }
+                table class="grid" {
                     thead { tr { th { "Model" } th { "Requests" } th { "Tokens" } } }
                     tbody { @for (name, reqs, toks) in &top_models {
                         tr { td { (name) } td { (reqs) } td { (toks) } }
                     } }
                 }
             }
-            div class="panel" style="flex:1; min-width:300px" {
-                h2 style="margin-top:0" { "Top keys (7d)" }
-                table {
+            div class="card" {
+                h2 { "Top keys (7d)" }
+                table class="grid" {
                     thead { tr { th { "Key" } th { "Requests" } th { "Tokens" } } }
                     tbody { @for (name, reqs, toks) in &top_keys {
                         tr { td { (name) } td { (reqs) } td { (toks) } }
@@ -161,34 +161,10 @@ pub async fn dashboard(State(st): State<AppState>) -> Response {
         }
         link rel="stylesheet" href="/admin/assets/uplot.min.css";
         script src="/admin/assets/uplot.iife.min.js" {}
-        script { (PreEscaped(DASHBOARD_JS)) }
+        script src="/admin/assets/dashboard.js" defer {}
     };
     Html(layout("Dashboard", "dashboard", body).into_string()).into_response()
 }
-
-const DASHBOARD_JS: &str = r#"
-(async function () {
-  const s = await (await fetch('/admin/api/stats?days=7')).json();
-  const width = Math.min(document.querySelector('main').clientWidth - 80, 1080);
-  const axisStyle = { stroke: '#8b949e', grid: { stroke: '#21262d' }, ticks: { stroke: '#30363d' } };
-  function mk(el, title, series, data) {
-    new uPlot({
-      width, height: 200, title,
-      cursor: { drag: { setScale: false } },
-      series: [{}, ...series],
-      axes: [axisStyle, axisStyle],
-    }, [s.hours, ...data], document.getElementById(el));
-  }
-  mk('chart-req', '', [
-    { label: 'requests', stroke: '#2f81f7', width: 2 },
-    { label: 'errors', stroke: '#f85149', width: 1 },
-  ], [s.requests, s.errors]);
-  mk('chart-tok', '', [
-    { label: 'prompt', stroke: '#3fb950', width: 2 },
-    { label: 'completion', stroke: '#d29922', width: 2 },
-  ], [s.prompt_tokens, s.completion_tokens]);
-})();
-"#;
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -242,8 +218,8 @@ pub async fn settings_page(State(st): State<AppState>) -> Response {
         .unwrap_or_default();
 
     let body = html! {
-        div class="panel" {
-            h2 style="margin-top:0" { "Retention" }
+        div class="card" {
+            h2 { "Retention" }
             p class="hint" { "Database size: " (format!("{:.2} GB", db_bytes as f64 / 1e9))
                 ". Full request/response payloads are logged for every request; pruning runs hourly." }
             form method="post" action="/admin/settings/retention" {
@@ -253,11 +229,11 @@ pub async fn settings_page(State(st): State<AppState>) -> Response {
                 label { "Keep database under (GB, empty = unlimited)" }
                 input type="number" step="0.1" name="max_db_gb" min="0.1"
                     value=(retention_gb.map(|g| format!("{g:.1}")).unwrap_or_default());
-                button type="submit" class="primary" style="margin-top:1rem" { "Save retention" }
+                button type="submit" class="primary" { "Save retention" }
             }
         }
-        div class="panel" {
-            h2 style="margin-top:0" { "Export logs" }
+        div class="card" {
+            h2 { "Export logs" }
             form method="get" action="/admin/export" {
                 label { "Format" }
                 select name="format" {
@@ -268,54 +244,52 @@ pub async fn settings_page(State(st): State<AppState>) -> Response {
                 input type="date" name="from";
                 label { "To (optional)" }
                 input type="date" name="to";
-                button type="submit" class="primary" style="margin-top:1rem" { "Download" }
+                button type="submit" class="primary" { "Download" }
             }
         }
-        div class="panel" {
-            h2 style="margin-top:0" { "Passkeys (FIDO2 second factor)" }
+        div class="card" {
+            h2 { "Passkeys (FIDO2 second factor)" }
             @if passkeys.is_empty() {
                 p class="hint" { "No passkeys enrolled — login uses password only. Enroll one to enable 2FA." }
             }
-            table {
+            table class="grid" {
                 tbody { @for (id, created) in &passkeys {
                     tr {
                         td { "Passkey #" (id) }
                         td class="muted" { "enrolled " (super::pages::fmt_ts(*created)) }
-                        td { form class="inline" method="post" action=(format!("/admin/settings/passkeys/{id}/delete")) {
-                            button class="danger" onclick="return confirm('Remove this passkey?')" { "Remove" }
+                        td { form class="inline" method="post" action=(format!("/admin/settings/passkeys/{id}/delete"))
+                                 data-confirm="Remove this passkey?" {
+                            button class="danger" { "Remove" }
                         } }
                     }
                 } }
             }
-            button id="enroll" class="primary" style="margin-top:.8rem" { "Enroll new passkey" }
-            p class="err" id="enroll-err" {}
-            script src="/admin/assets/webauthn.js" {}
-            script { (PreEscaped(r#"
-                document.getElementById('enroll').addEventListener('click', async () => {
-                    try { await window.inginxRegisterPasskey(); location.reload(); }
-                    catch (e) { document.getElementById('enroll-err').textContent = e.message; }
-                });
-            "#)) }
+            // Wired by webauthn.js on load — no inline handler, so the page
+            // needs no script-src exception. `data-passkey-error` is where a
+            // failure is shown; success reloads the list.
+            button class="primary" data-passkey-enroll data-passkey-reload { "Enroll new passkey" }
+            p class="err" data-passkey-error {}
+            script src="/admin/assets/webauthn.js" defer {}
         }
-        div class="panel" {
-            h2 style="margin-top:0" { "WebAuthn relying party" }
+        div class="card" {
+            h2 { "WebAuthn relying party" }
             p class="hint" { "Must match the domain the admin GUI is served on. Changing it invalidates enrolled passkeys." }
             form method="post" action="/admin/settings/rp" {
                 label { "RP ID (domain)" }
                 input type="text" name="rp_id" value=(rp_id) placeholder="admin.example.com";
                 label { "Origin" }
                 input type="text" name="rp_origin" value=(rp_origin) placeholder="https://admin.example.com";
-                button type="submit" style="margin-top:1rem" { "Save" }
+                button type="submit" { "Save" }
             }
         }
-        div class="panel" {
-            h2 style="margin-top:0" { "Change admin password" }
+        div class="card" {
+            h2 { "Change admin password" }
             form method="post" action="/admin/settings/password" {
                 label { "Current password" }
                 input type="password" name="current" required;
                 label { "New password (min 12 characters)" }
                 input type="password" name="new" required minlength="12";
-                button type="submit" class="primary" style="margin-top:1rem" { "Change password" }
+                button type="submit" class="primary" { "Change password" }
             }
         }
     };

@@ -170,6 +170,15 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
 pub fn spawn_pruner(db: Db) {
     tokio::spawn(async move {
         loop {
+            // Expired sessions are already refused at lookup, but a dead row
+            // is still a row: sweep them so the table tracks live sessions
+            // rather than every login since the database was made.
+            let _ = db
+                .call(|c| {
+                    c.execute("DELETE FROM sessions WHERE expires_at < ?1", [now()])?;
+                    Ok(())
+                })
+                .await;
             let max_age = get_setting(&db, "retention_max_age_secs")
                 .await
                 .ok()
