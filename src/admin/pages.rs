@@ -51,6 +51,8 @@ pub async fn assets(Path(file): Path<String>) -> Response {
         "app.css" => (include_bytes!("../../assets/app.css"), "text/css"),
         "htmx.min.js" => (include_bytes!("../../assets/htmx.min.js"), "text/javascript"),
         "webauthn.js" => (include_bytes!("../../assets/webauthn.js"), "text/javascript"),
+        "uplot.iife.min.js" => (include_bytes!("../../assets/uplot.iife.min.js"), "text/javascript"),
+        "uplot.min.css" => (include_bytes!("../../assets/uplot.min.css"), "text/css"),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     (
