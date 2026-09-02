@@ -8,18 +8,45 @@ async fn spawn_app(app: axum::Router) -> SocketAddr {
     addr
 }
 
+/// Mimics llama.cpp: streams SSE when `stream:true`, and emits the final
+/// usage chunk only when `stream_options.include_usage` was requested.
+async fn mock_chat(axum::Json(body): axum::Json<serde_json::Value>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if body["stream"].as_bool() != Some(true) {
+        return axum::Json(serde_json::json!({
+            "choices":[{"message":{"role":"assistant","content":"hi"}}],
+            "usage":{"prompt_tokens":3,"completion_tokens":2}
+        }))
+        .into_response();
+    }
+    let include_usage = body["stream_options"]["include_usage"].as_bool() == Some(true);
+    let mut events: Vec<String> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n\n".into(),
+        "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n".into(),
+        "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n".into(),
+    ];
+    if include_usage {
+        events.push(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3}}\n\n"
+                .into(),
+        );
+    }
+    events.push("data: [DONE]\n\n".into());
+    use futures_util::StreamExt;
+    let stream = futures_util::stream::iter(events).then(|e| async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Ok::<_, std::convert::Infallible>(e)
+    });
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
+}
+
 async fn spawn_mock_upstream() -> SocketAddr {
     use axum::{routing::get, routing::post, Json, Router};
     let app = Router::new()
-        .route(
-            "/chat/completions",
-            post(|| async {
-                Json(serde_json::json!({
-                    "choices":[{"message":{"role":"assistant","content":"hi"}}],
-                    "usage":{"prompt_tokens":3,"completion_tokens":2}
-                }))
-            }),
-        )
+        .route("/chat/completions", post(mock_chat))
         .route(
             "/models",
             get(|| async { Json(serde_json::json!({"data":[{"id":"m-upstream"}]})) }),
@@ -96,6 +123,94 @@ async fn chat_roundtrip_metered_and_logged() {
     assert_eq!((pt, ct), (3, 2));
     assert_eq!(src, "upstream");
     assert_eq!(model, "m");
+}
+
+#[tokio::test]
+async fn stream_passthrough_suppresses_injected_usage() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/chat/completions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("data: [DONE]"), "body: {body}");
+    assert!(
+        body.contains("\"He\"") && body.contains("\"llo\""),
+        "chunks must be forwarded: {body}"
+    );
+    assert!(
+        !body.contains("\"usage\""),
+        "injected usage chunk must be suppressed: {body}"
+    );
+    wait_for_rows(&ctx.db, 1).await;
+    let (pt, ct, src): (i64, i64, String) = ctx
+        .db
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT prompt_tokens, completion_tokens, usage_source FROM requests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!((pt, ct), (11, 3));
+    assert_eq!(src, "upstream");
+}
+
+#[tokio::test]
+async fn stream_forwards_usage_when_client_asked() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/chat/completions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({
+            "model":"m","stream":true,
+            "stream_options":{"include_usage":true},
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("\"usage\""), "client asked for usage: {body}");
+    assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn client_disconnect_still_logs() {
+    use futures_util::StreamExt;
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/chat/completions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}]}))
+        .send()
+        .await
+        .unwrap();
+    let mut stream = resp.bytes_stream();
+    let _first = stream.next().await.unwrap().unwrap();
+    drop(stream); // client walks away mid-stream
+
+    for _ in 0..300 {
+        let err: Option<String> = ctx
+            .db
+            .call(|c| {
+                Ok(c.query_row("SELECT error FROM requests LIMIT 1", [], |r| r.get(0))
+                    .ok())
+            })
+            .await
+            .unwrap();
+        if err.as_deref() == Some("client_disconnected") {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no client_disconnected log row appeared");
 }
 
 #[tokio::test]

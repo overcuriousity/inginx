@@ -345,8 +345,11 @@ fn log_failure(st: &AppState, base: LogBase, status: u16, error: String) {
     });
 }
 
-/// Task 9 replaces this with a filtering tee; for now: raw passthrough that
-/// logs after the stream ends.
+/// Streams the upstream SSE response to the client while capturing every byte
+/// for logging. When the usage chunk was injected by inginx (the client did
+/// not ask for it), that chunk is filtered out of the client stream. Logging
+/// happens in the tee's Drop, which fires on natural end AND client
+/// disconnect.
 fn stream_response(
     st: AppState,
     base: LogBase,
@@ -354,16 +357,188 @@ fn stream_response(
     status: reqwest::StatusCode,
     resp_headers: String,
     resp_content_type: String,
-    _usage_injected: bool,
+    usage_injected: bool,
 ) -> Response {
     use futures_util::StreamExt;
-    let stream = upstream.bytes_stream().map(|c| c.map_err(std::io::Error::other));
-    let _ = (st, base, resp_headers);
+    let tee = StreamTee {
+        inner: upstream.bytes_stream().boxed(),
+        st,
+        base: Some(base),
+        status: status.as_u16(),
+        resp_headers,
+        filter: usage_injected,
+        pending: Vec::new(),
+        capture: Vec::new(),
+        ttfb_ms: None,
+        completed: false,
+    };
     Response::builder()
         .status(status.as_u16())
         .header(header::CONTENT_TYPE, resp_content_type)
-        .body(axum::body::Body::from_stream(stream))
+        .body(axum::body::Body::from_stream(tee))
         .unwrap_or_else(|_| openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error", "internal"))
+}
+
+struct StreamTee {
+    inner: futures_util::stream::BoxStream<'static, reqwest::Result<Bytes>>,
+    st: AppState,
+    base: Option<LogBase>,
+    status: u16,
+    resp_headers: String,
+    filter: bool,
+    pending: Vec<u8>,
+    capture: Vec<u8>,
+    ttfb_ms: Option<u32>,
+    completed: bool,
+}
+
+/// Finds the end of the first complete SSE event in `buf` (delimiter
+/// included), handling both `\n\n` and `\r\n\r\n`.
+fn event_boundary(buf: &[u8]) -> Option<usize> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// True for the injected final chunk: carries `usage` with no choices content.
+fn is_usage_only_event(event: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(event) else {
+        return false;
+    };
+    for line in text.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            return false;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+            let has_usage = v.get("usage").map(|u| u.is_object()).unwrap_or(false);
+            let choices_empty = v
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            return has_usage && choices_empty;
+        }
+    }
+    false
+}
+
+impl futures_util::Stream for StreamTee {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    this.completed = true;
+                    if this.pending.is_empty() {
+                        this.finish();
+                        return Poll::Ready(None);
+                    }
+                    // flush whatever incomplete tail remains
+                    let tail = std::mem::take(&mut this.pending);
+                    this.finish();
+                    return Poll::Ready(Some(Ok(Bytes::from(tail))));
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    this.completed = true;
+                    this.finish_with_error(format!("upstream stream error: {e}"));
+                    return Poll::Ready(Some(Err(std::io::Error::other(e))));
+                }
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if this.ttfb_ms.is_none() {
+                        if let Some(base) = &this.base {
+                            this.ttfb_ms = Some(base.started.elapsed().as_millis() as u32);
+                        }
+                    }
+                    this.capture.extend_from_slice(&chunk);
+                    if !this.filter {
+                        return Poll::Ready(Some(Ok(chunk)));
+                    }
+                    this.pending.extend_from_slice(&chunk);
+                    let mut out = Vec::new();
+                    while let Some(end) = event_boundary(&this.pending) {
+                        let event: Vec<u8> = this.pending.drain(..end).collect();
+                        if !is_usage_only_event(&event) {
+                            out.extend_from_slice(&event);
+                        }
+                    }
+                    if !out.is_empty() {
+                        return Poll::Ready(Some(Ok(Bytes::from(out))));
+                    }
+                    // nothing to emit yet; poll upstream again
+                }
+            }
+        }
+    }
+}
+
+impl StreamTee {
+    fn build_record(&mut self, error: Option<String>) -> Option<LogRecord> {
+        let base = self.base.take()?;
+        let (usage, usage_source) = match metering::extract_usage_sse(&self.capture) {
+            Some(u) => (u, "upstream"),
+            None => (
+                metering::Usage {
+                    prompt_tokens: metering::estimate_body_tokens(&base.req_body),
+                    completion_tokens: metering::estimate_body_tokens(&self.capture),
+                },
+                "estimated",
+            ),
+        };
+        Some(LogRecord {
+            id: ulid::Ulid::new().to_string(),
+            ts: now(),
+            key_id: base.key_id,
+            model: base.model,
+            endpoint: base.endpoint,
+            status: self.status,
+            latency_ms: base.started.elapsed().as_millis() as u32,
+            ttfb_ms: self.ttfb_ms,
+            usage,
+            usage_source,
+            error,
+            req_headers: base.req_headers,
+            resp_headers: std::mem::take(&mut self.resp_headers),
+            req_body: base.req_body,
+            resp_body: std::mem::take(&mut self.capture),
+        })
+    }
+
+    fn finish(&mut self) {
+        if let Some(rec) = self.build_record(None) {
+            self.st.log.send(rec);
+        }
+    }
+
+    fn finish_with_error(&mut self, error: String) {
+        if let Some(rec) = self.build_record(Some(error)) {
+            self.st.log.send(rec);
+        }
+    }
+}
+
+impl Drop for StreamTee {
+    fn drop(&mut self) {
+        if self.base.is_some() {
+            let error = (!self.completed).then(|| "client_disconnected".to_string());
+            if let Some(rec) = self.build_record(error) {
+                self.st.log.send(rec);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
