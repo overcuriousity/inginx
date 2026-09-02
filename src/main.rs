@@ -1,6 +1,7 @@
 mod config;
 mod db;
 mod keys;
+mod metering;
 mod registry;
 
 use anyhow::Result;
