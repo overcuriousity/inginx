@@ -1,6 +1,7 @@
 mod config;
 mod db;
 mod keys;
+mod logstore;
 mod metering;
 mod registry;
 
