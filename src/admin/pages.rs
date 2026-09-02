@@ -198,6 +198,108 @@ pub async fn keys_page(State(st): State<AppState>) -> Response {
     Html(layout("API Keys", "keys", body).into_string()).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Backends
+// ---------------------------------------------------------------------------
+
+/// Pings `{base_url}/models` with a short timeout; used for the health dot.
+pub async fn backend_up(http: &reqwest::Client, b: &crate::registry::Backend) -> bool {
+    let mut req = http
+        .get(format!("{}/models", b.base_url))
+        .timeout(std::time::Duration::from_millis(1500));
+    if let Some(k) = &b.upstream_api_key {
+        req = req.bearer_auth(k);
+    }
+    matches!(req.send().await, Ok(r) if r.status().is_success())
+}
+
+pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Result<Markup> {
+    let backends = crate::registry::list_backends(&st.db).await?;
+    let models = crate::registry::list_models(&st.db).await?;
+    let mut health = Vec::new();
+    for b in &backends {
+        health.push(backend_up(&st.http, b).await);
+    }
+    Ok(html! {
+        div id="backends-area" {
+            @if let Some(n) = notice {
+                div class="panel" { (n) }
+            }
+            @for (b, up) in backends.iter().zip(&health) {
+                div class="panel" {
+                    h2 style="margin-top:0" {
+                        span class=(if *up { "health-dot up" } else { "health-dot down" }) {}
+                        (b.name) " "
+                        span class="muted mono" style="font-weight:400;font-size:.8rem" { (b.base_url) }
+                        @if b.is_default { " " span class="badge muted" { "default" } }
+                        @if !b.enabled { " " span class="badge err" { "disabled" } }
+                    }
+                    div style="margin-bottom:.6rem" {
+                        button hx-post=(format!("/admin/backends/{}/import", b.id))
+                            hx-target="#backends-area" hx-swap="outerHTML" { "Import from /models" }
+                        " "
+                        @if !b.is_default {
+                            button hx-post=(format!("/admin/backends/{}/default", b.id))
+                                hx-target="#backends-area" hx-swap="outerHTML" { "Make default" }
+                        }
+                    }
+                    table {
+                        thead { tr { th { "Alias (public)" } th { "Upstream name" } th { "Status" } th {} } }
+                        tbody {
+                            @for m in models.iter().filter(|m| m.backend_id == b.id) {
+                                tr {
+                                    td {
+                                        form class="inline" hx-post=(format!("/admin/models/{}/alias", m.id))
+                                            hx-target="#backends-area" hx-swap="outerHTML" {
+                                            input type="text" name="alias" value=(m.alias)
+                                                style="max-width:220px" title="Edit and press Enter to rename";
+                                        }
+                                    }
+                                    td class="mono" { (m.upstream_name) }
+                                    td {
+                                        @if m.enabled { span class="badge ok" { "enabled" } }
+                                        @else { span class="badge muted" { "disabled" } }
+                                    }
+                                    td {
+                                        button hx-post=(format!("/admin/models/{}/toggle", m.id))
+                                            hx-target="#backends-area" hx-swap="outerHTML" {
+                                            @if m.enabled { "Disable" } @else { "Enable" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+pub async fn backends_page(State(st): State<AppState>) -> Response {
+    let area = match backends_area(&st, None).await {
+        Ok(a) => a,
+        Err(e) => return err500(e),
+    };
+    let body = html! {
+        div class="panel" {
+            h2 style="margin-top:0" { "Add backend" }
+            form hx-post="/admin/backends" hx-target="#backends-area" hx-swap="outerHTML" {
+                label { "Name" }
+                input type="text" name="name" required placeholder="gpu1";
+                label { "Base URL (OpenAI-compatible, including /v1)" }
+                input type="text" name="base_url" required placeholder="http://10.0.0.5:8080/v1";
+                label { "Upstream API key (optional)" }
+                input type="password" name="upstream_api_key";
+                label { input type="checkbox" name="is_default"; " Default backend (for requests without a known model)" }
+                button type="submit" class="primary" style="margin-top:1rem" { "Add backend" }
+            }
+        }
+        (area)
+    };
+    Html(layout("Backends", "backends", body).into_string()).into_response()
+}
+
 pub fn err500(e: anyhow::Error) -> Response {
     tracing::error!("admin page error: {e}");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

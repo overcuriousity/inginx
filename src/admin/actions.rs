@@ -64,6 +64,103 @@ pub async fn rotate_key(State(st): State<AppState>, Path(id): Path<i64>) -> Resp
     }
 }
 
+// ---------------------------------------------------------------------------
+// Backends
+// ---------------------------------------------------------------------------
+
+use super::pages::backends_area;
+use crate::registry;
+
+async fn render_backends(st: &AppState, notice: Option<String>) -> Response {
+    match backends_area(st, notice).await {
+        Ok(a) => Html(a.into_string()).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+pub async fn add_backend(State(st): State<AppState>, RawForm(body): RawForm) -> Response {
+    let fields = form_fields(&body);
+    let get = |name: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    let (name, base_url, api_key) = (get("name"), get("base_url"), get("upstream_api_key"));
+    if name.is_empty() || base_url.is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, "name and base_url are required").into_response();
+    }
+    let is_default = fields.iter().any(|(k, _)| k == "is_default");
+    let key = (!api_key.is_empty()).then_some(api_key);
+    match registry::add_backend(&st.db, &name, &base_url, key, is_default).await {
+        Ok(_) => render_backends(&st, None).await,
+        Err(e) => err500(e),
+    }
+}
+
+pub async fn import_backend(State(st): State<AppState>, Path(id): Path<i64>) -> Response {
+    match registry::import_models(&st.db, id).await {
+        Ok(added) if added.is_empty() => {
+            render_backends(&st, Some("No new models found.".into())).await
+        }
+        Ok(added) => {
+            render_backends(&st, Some(format!("Imported {} models: {}", added.len(), added.join(", ")))).await
+        }
+        Err(e) => {
+            render_backends(&st, Some(format!("Import failed: {e}"))).await
+        }
+    }
+}
+
+pub async fn make_default_backend(State(st): State<AppState>, Path(id): Path<i64>) -> Response {
+    match registry::make_default(&st.db, id).await {
+        Ok(()) => render_backends(&st, None).await,
+        Err(e) => err500(e),
+    }
+}
+
+pub async fn toggle_model(State(st): State<AppState>, Path(id): Path<i64>) -> Response {
+    let enabled: Option<bool> = st
+        .db
+        .call(move |c| {
+            Ok(c.query_row("SELECT enabled FROM models WHERE id = ?1", [id], |r| {
+                Ok(r.get::<_, i64>(0)? != 0)
+            })
+            .ok())
+        })
+        .await
+        .ok()
+        .flatten();
+    let Some(enabled) = enabled else {
+        return (axum::http::StatusCode::NOT_FOUND, "no such model").into_response();
+    };
+    match registry::set_model_enabled(&st.db, id, !enabled).await {
+        Ok(()) => render_backends(&st, None).await,
+        Err(e) => err500(e),
+    }
+}
+
+pub async fn rename_model(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    RawForm(body): RawForm,
+) -> Response {
+    let fields = form_fields(&body);
+    let alias = fields
+        .iter()
+        .find(|(k, _)| k == "alias")
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_default();
+    if alias.is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, "alias is required").into_response();
+    }
+    match registry::set_model_alias(&st.db, id, &alias).await {
+        Ok(()) => render_backends(&st, None).await,
+        Err(e) => render_backends(&st, Some(format!("Rename failed: {e}"))).await,
+    }
+}
+
 async fn render_area(st: &AppState, new_key: Option<&str>) -> Response {
     match key_rows(&st.db).await {
         Ok(rows) => Html(keys_area(&rows, new_key).into_string()).into_response(),

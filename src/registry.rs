@@ -187,6 +187,40 @@ pub async fn models_for_key(db: &Db, key: &ApiKey) -> Result<Vec<Model>> {
     .await
 }
 
+pub async fn set_model_enabled(db: &Db, model_id: i64, enabled: bool) -> Result<()> {
+    db.call(move |c| {
+        c.execute(
+            "UPDATE models SET enabled = ?1 WHERE id = ?2",
+            rusqlite::params![enabled as i64, model_id],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn set_model_alias(db: &Db, model_id: i64, alias: &str) -> Result<()> {
+    let alias = alias.to_string();
+    db.call(move |c| {
+        c.execute(
+            "UPDATE models SET alias = ?1 WHERE id = ?2",
+            rusqlite::params![alias, model_id],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn make_default(db: &Db, backend_id: i64) -> Result<()> {
+    db.call(move |c| {
+        let tx = c.transaction()?;
+        tx.execute("UPDATE backends SET is_default = 0", [])?;
+        tx.execute("UPDATE backends SET is_default = 1 WHERE id = ?1", [backend_id])?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 /// Fetches `{base_url}/models`, inserts models not yet present (alias = upstream
 /// name), and returns the newly added upstream names.
 pub async fn import_models(db: &Db, backend_id: i64) -> Result<Vec<String>> {

@@ -11,6 +11,14 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/keys", get(pages::keys_page).post(actions::create_key))
         .route("/admin/keys/{id}/revoke", post(actions::revoke_key))
         .route("/admin/keys/{id}/rotate", post(actions::rotate_key))
+        .route(
+            "/admin/backends",
+            get(pages::backends_page).post(actions::add_backend),
+        )
+        .route("/admin/backends/{id}/import", post(actions::import_backend))
+        .route("/admin/backends/{id}/default", post(actions::make_default_backend))
+        .route("/admin/models/{id}/toggle", post(actions::toggle_model))
+        .route("/admin/models/{id}/alias", post(actions::rename_model))
         .with_state(state.clone());
     Router::new()
         .route("/admin/assets/{file}", get(pages::assets))
@@ -130,6 +138,62 @@ mod tests {
             .await
             .unwrap();
         assert!(revoked.is_some());
+    }
+
+    #[tokio::test]
+    async fn backends_page_and_import() {
+        let (st, app, cookie) = logged_in().await;
+
+        // mock upstream for import
+        let mock = axum::Router::new().route(
+            "/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"data":[{"id":"qwen3-8b"},{"id":"bge-m3"}]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let (status, _) = post_form(
+            &app,
+            "/admin/backends",
+            &format!("name=gpu1&base_url=http://{addr}&is_default=on"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let backends = crate::registry::list_backends(&st.db).await.unwrap();
+        assert_eq!(backends.len(), 1);
+
+        let (status, body) = post_form(
+            &app,
+            &format!("/admin/backends/{}/import", backends[0].id),
+            "",
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("qwen3-8b") && body.contains("bge-m3"), "{body}");
+
+        let models = crate::registry::list_models(&st.db).await.unwrap();
+        assert_eq!(models.len(), 2);
+        let m = &models[0];
+        let (status, _) = post_form(&app, &format!("/admin/models/{}/toggle", m.id), "", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        let models = crate::registry::list_models(&st.db).await.unwrap();
+        assert!(!models.iter().find(|x| x.id == m.id).unwrap().enabled);
+
+        let (status, _) = post_form(
+            &app,
+            &format!("/admin/models/{}/alias", m.id),
+            "alias=renamed",
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let models = crate::registry::list_models(&st.db).await.unwrap();
+        assert!(models.iter().any(|x| x.alias == "renamed"));
     }
 
     #[tokio::test]
