@@ -167,12 +167,11 @@ pub async fn models_for_key(db: &Db, key: &ApiKey) -> Result<Vec<Model>> {
                  ORDER BY alias"
             )
         } else {
-            format!(
-                "SELECT m.id, m.backend_id, m.upstream_name, m.alias, m.enabled FROM models m
-                 JOIN key_models km ON km.model_id = m.id AND km.key_id = ?1
-                 JOIN backends b ON b.id = m.backend_id AND b.enabled = 1
-                 WHERE m.enabled = 1 ORDER BY m.alias"
-            )
+            "SELECT m.id, m.backend_id, m.upstream_name, m.alias, m.enabled FROM models m
+             JOIN key_models km ON km.model_id = m.id AND km.key_id = ?1
+             JOIN backends b ON b.id = m.backend_id AND b.enabled = 1
+             WHERE m.enabled = 1 ORDER BY m.alias"
+                .to_string()
         };
         let mut stmt = c.prepare(&sql)?;
         let rows = if all {

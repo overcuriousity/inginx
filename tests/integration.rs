@@ -354,6 +354,30 @@ async fn unreachable_backend_502_openai_shape() {
 }
 
 #[tokio::test]
+async fn merged_listener_serves_api_and_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("t.db")).unwrap();
+    std::mem::forget(dir);
+    let state = proxy::AppState {
+        db: db.clone(),
+        log: logstore::spawn_writer(db.clone()),
+        http: reqwest::Client::new(),
+    };
+    let app = proxy::router(state.clone()).merge(inginx::admin::router(state));
+    let addr = spawn_app(app).await;
+    let client = reqwest::Client::new();
+    // admin login page renders
+    let r = client.get(format!("http://{addr}/admin/login")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("Sign in"));
+    // API answers on the same port (401 without key, OpenAI shape)
+    let r = client.get(format!("http://{addr}/v1/models")).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "invalid_api_key");
+}
+
+#[tokio::test]
 async fn models_filtered_per_key() {
     let ctx = setup().await;
     // second model the limited key cannot use

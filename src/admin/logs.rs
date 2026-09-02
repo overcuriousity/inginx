@@ -281,9 +281,16 @@ pub fn render_payload(body: &[u8], download_url: &str) -> Markup {
     }
 }
 
+/// (ts, key_name, model, endpoint, status, latency, ttfb, prompt_tokens,
+/// completion_tokens, usage_source, error, req_headers, resp_headers)
+type DetailRow = (
+    i64, Option<String>, Option<String>, String, u16, u32, Option<u32>,
+    u32, u32, String, Option<String>, String, String,
+);
+
 pub async fn log_detail(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     let idq = id.clone();
-    let row: Option<(i64, Option<String>, Option<String>, String, u16, u32, Option<u32>, u32, u32, String, Option<String>, String, String)> = match st
+    let row: Option<DetailRow> = match st
         .db
         .call(move |c| {
             let v = c

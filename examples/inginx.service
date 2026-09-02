@@ -1,0 +1,23 @@
+[Unit]
+Description=inginx OpenAI-compatible inference proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/inginx
+Environment=INGINX_CONFIG=/var/lib/inginx/inginx.toml
+WorkingDirectory=/var/lib/inginx
+DynamicUser=yes
+StateDirectory=inginx
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/inginx
+
+[Install]
+WantedBy=multi-user.target
