@@ -14,16 +14,19 @@ async fn mock_chat(axum::Json(body): axum::Json<serde_json::Value>) -> axum::res
     use axum::response::IntoResponse;
     if body["stream"].as_bool() != Some(true) {
         return axum::Json(serde_json::json!({
+            // A real backend answers with its own model name.
+            "model": body["model"],
             "choices":[{"message":{"role":"assistant","content":"hi"}}],
             "usage":{"prompt_tokens":3,"completion_tokens":2}
         }))
         .into_response();
     }
     let include_usage = body["stream_options"]["include_usage"].as_bool() == Some(true);
+    let model = body["model"].as_str().unwrap_or("").to_string();
     let mut events: Vec<String> = vec![
-        "data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n\n".into(),
-        "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n".into(),
-        "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n".into(),
+        format!("data: {{\"model\":\"{model}\",\"choices\":[{{\"delta\":{{\"content\":\"He\"}}}}]}}\n\n"),
+        format!("data: {{\"model\":\"{model}\",\"choices\":[{{\"delta\":{{\"content\":\"llo\"}}}}]}}\n\n"),
+        format!("data: {{\"model\":\"{model}\",\"choices\":[{{\"delta\":{{\"content\":\"!\"}}}}]}}\n\n"),
     ];
     if include_usage {
         events.push(
@@ -112,9 +115,16 @@ async fn spawn_mock_upstream() -> SocketAddr {
             }),
         )
         // Echoes the body back so a test can see what inginx forwarded.
+        // Echoes what it received. The model is reported under a second name
+        // as well, because the response's own `model` is mapped back to the
+        // alias on the way out.
         .route(
             "/audio/speech-echo",
-            post(|axum::Json(b): axum::Json<serde_json::Value>| async move { Json(b) }),
+            post(|axum::Json(b): axum::Json<serde_json::Value>| async move {
+                let mut out = b.clone();
+                out["model_seen"] = b["model"].clone();
+                Json(out)
+            }),
         )
         // Reports the model it was asked for, the way llama-swap would fail
         // on one it does not know.
@@ -633,8 +643,10 @@ async fn voice_map_rewrites_the_forwarded_request() {
     assert_eq!(resp.status(), 200);
     let echoed: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(echoed["voice"], "af_alloy");
-    // The model name is still rewritten to the upstream one.
-    assert_eq!(echoed["model"], "m-upstream");
+    // The backend was asked for its own model name...
+    assert_eq!(echoed["model_seen"], "m-upstream");
+    // ...and the client is answered with the alias it used.
+    assert_eq!(echoed["model"], "m");
 }
 
 #[tokio::test]
@@ -845,4 +857,65 @@ async fn multipart_uploads_reach_the_backend_under_its_own_model_name() {
         .await
         .unwrap();
     assert_eq!(v["model_seen"], "m-upstream");
+}
+
+#[tokio::test]
+async fn the_client_never_sees_the_backends_model_name() {
+    let ctx = setup().await;
+    // Buffered.
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("http://{}/v1/chat/completions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["model"], "m", "the alias, not m-upstream");
+
+    // Streaming: every chunk, and the log still holds what the backend said.
+    let body = reqwest::Client::new()
+        .post(format!("http://{}/v1/chat/completions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m","stream":true,"messages":[]}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!body.contains("m-upstream"), "leaked upstream name: {body}");
+    assert!(body.contains("\"model\":\"m\""), "{body}");
+    assert!(
+        body.contains("data: [DONE]"),
+        "framing must survive: {body}"
+    );
+    assert!(
+        body.contains("\"content\":\"llo\""),
+        "chunks must survive: {body}"
+    );
+
+    wait_for_rows(&ctx.db, 2).await;
+    let ids: Vec<String> = ctx
+        .db
+        .call(|c| {
+            let mut stmt = c.prepare("SELECT id FROM requests")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+    let mut logged_upstream = false;
+    for id in ids {
+        let (_, resp) = logstore::get_bodies(&ctx.db, &id).await.unwrap().unwrap();
+        if String::from_utf8_lossy(&resp).contains("m-upstream") {
+            logged_upstream = true;
+        }
+    }
+    assert!(
+        logged_upstream,
+        "the log is the record of what the backend actually said"
+    );
 }

@@ -108,6 +108,11 @@ the database.
   and never reaches the log at all. `upstream_retry_on_5xx` covers the other
   half of a model swapper's behaviour: a 502/503 that means "still starting"
   is retried once, before any byte has reached the client.
+- The model name is translated in both directions: requests are rewritten to
+  the backend's own name (in JSON bodies and in multipart uploads), and
+  responses — buffered and streamed — are mapped back to the alias, so a
+  client never sees your file paths or quantization choices. The request log
+  keeps the backend's own words.
 - Upstream failures that are not OpenAI-shaped (llama-swap answers a failed
   model start with plain text) are wrapped in `{"error": {...}}` on the way
   out, keeping the backend's own wording as the message. The untouched body

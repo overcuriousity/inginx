@@ -507,6 +507,88 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Maps the backend's model name in a response back to the alias the client
+/// asked for. Returns `None` when there is nothing to change.
+///
+/// inginx rewrites the model on the way in; without this the way out still
+/// named the backend — a chat completion answered `"model":
+/// "unsloth/Qwen3.5-9B-GGUF:q5_k_m"` to a client that asked for
+/// `gpgpu/qwen3-5`. That leaks the operator's file layout and quantization
+/// choices to every caller, and clients that check the response model against
+/// the request see a mismatch. Only a value equal to the upstream name is
+/// replaced, so an unrelated `model` field is left alone.
+pub(crate) fn rewrite_model_json(body: &[u8], upstream: &str, alias: &str) -> Option<Vec<u8>> {
+    if upstream == alias {
+        return None;
+    }
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !replace_model_value(&mut v, upstream, alias) {
+        return None;
+    }
+    serde_json::to_vec(&v).ok()
+}
+
+/// Replaces `model` at the top level and one level into a `data` array (where
+/// embeddings and image responses put theirs). Reports whether anything
+/// changed.
+fn replace_model_value(v: &mut serde_json::Value, upstream: &str, alias: &str) -> bool {
+    let mut changed = false;
+    let mut set = |obj: &mut serde_json::Value| {
+        if obj.get("model").and_then(|m| m.as_str()) == Some(upstream) {
+            obj["model"] = serde_json::Value::String(alias.to_string());
+            changed = true;
+        }
+    };
+    set(v);
+    if let Some(items) = v.get_mut("data").and_then(|d| d.as_array_mut()) {
+        for item in items {
+            if item.get("model").and_then(|m| m.as_str()) == Some(upstream) {
+                item["model"] = serde_json::Value::String(alias.to_string());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// The same substitution inside one SSE event. The event's framing — the
+/// `data:` prefix, any other fields, the blank-line terminator — is preserved
+/// byte for byte; only the JSON payload of a `data:` line is re-serialized,
+/// and only when it actually names the upstream model.
+pub(crate) fn rewrite_model_sse(event: &[u8], upstream: &str, alias: &str) -> Option<Vec<u8>> {
+    if upstream == alias || find_bytes(event, upstream.as_bytes()).is_none() {
+        return None;
+    }
+    let text = std::str::from_utf8(event).ok()?;
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let terminator = &line[trimmed.len()..];
+        match trimmed.strip_prefix("data:") {
+            Some(payload) if payload.trim() != "[DONE]" => {
+                let mut renamed = None;
+                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(payload.trim()) {
+                    if replace_model_value(&mut v, upstream, alias) {
+                        renamed = Some(v.to_string());
+                    }
+                }
+                match renamed {
+                    Some(json) => {
+                        changed = true;
+                        out.push_str("data: ");
+                        out.push_str(&json);
+                        out.push_str(terminator);
+                    }
+                    None => out.push_str(line),
+                }
+            }
+            _ => out.push_str(line),
+        }
+    }
+    changed.then(|| out.into_bytes())
+}
+
 pub async fn proxy_handler(
     State(st): State<AppState>,
     Extension(key): Extension<ApiKey>,
@@ -695,14 +777,22 @@ pub async fn proxy_handler(
         .to_string();
 
     if resp_content_type.starts_with("text/event-stream") {
+        // Same mapping as the buffered path, applied per SSE event.
+        let rename = match (&upstream_model, &log_base.model) {
+            (Some(up), Some(alias)) if up != alias => Some((up.clone(), alias.clone())),
+            _ => None,
+        };
         return stream_response(
             st,
             log_base,
             upstream_resp,
-            status,
-            resp_headers,
-            resp_content_type,
-            usage_injected,
+            StreamCtx {
+                status,
+                resp_headers,
+                resp_content_type,
+                usage_injected,
+                rename,
+            },
         );
     }
 
@@ -770,7 +860,16 @@ pub async fn proxy_handler(
     // keeping the original text as the message — and note that the log above
     // already holds the untouched body.
     let client_body = if status.is_success() || looks_like_openai_error(&resp_body) {
-        resp_body
+        // The log above holds the upstream's own words; the client gets the
+        // name it asked for.
+        match (&upstream_model, &log_base.model) {
+            (Some(up), Some(alias)) if resp_content_type.starts_with("application/json") => {
+                rewrite_model_json(&resp_body, up, alias)
+                    .map(Bytes::from)
+                    .unwrap_or(resp_body)
+            }
+            _ => resp_body,
+        }
     } else {
         return normalized_upstream_error(status, &resp_body);
     };
@@ -824,15 +923,32 @@ fn log_failure(st: &AppState, base: LogBase, status: u16, error: String) {
 /// not ask for it), that chunk is filtered out of the client stream. Logging
 /// happens in the tee's Drop, which fires on natural end AND client
 /// disconnect.
+/// Everything the streaming path needs to know about the response it is
+/// about to tee, gathered so the function keeps one argument per idea.
+pub(crate) struct StreamCtx {
+    pub status: reqwest::StatusCode,
+    pub resp_headers: String,
+    pub resp_content_type: String,
+    /// The client did not ask for a usage chunk, so the one inginx requested
+    /// is filtered back out.
+    pub usage_injected: bool,
+    /// `(upstream name, alias)` when they differ.
+    pub rename: Option<(String, String)>,
+}
+
 fn stream_response(
     st: AppState,
     base: LogBase,
     upstream: reqwest::Response,
-    status: reqwest::StatusCode,
-    resp_headers: String,
-    resp_content_type: String,
-    usage_injected: bool,
+    ctx: StreamCtx,
 ) -> Response {
+    let StreamCtx {
+        status,
+        resp_headers,
+        resp_content_type,
+        usage_injected,
+        rename,
+    } = ctx;
     use futures_util::StreamExt;
     let idle = st.upstream_stream_idle;
     let tee = StreamTee {
@@ -844,6 +960,7 @@ fn stream_response(
         status: status.as_u16(),
         resp_headers,
         filter: usage_injected,
+        rename,
         pending: Vec::new(),
         capture: Vec::new(),
         ttfb_ms: None,
@@ -874,6 +991,9 @@ struct StreamTee {
     status: u16,
     resp_headers: String,
     filter: bool,
+    /// `(upstream name, alias)` when the two differ: every `data:` payload
+    /// naming the backend's model is rewritten to the alias on its way out.
+    rename: Option<(String, String)>,
     pending: Vec<u8>,
     capture: Vec<u8>,
     ttfb_ms: Option<u32>,
@@ -970,16 +1090,28 @@ impl futures_util::Stream for StreamTee {
                             this.ttfb_ms = Some(base.started.elapsed().as_millis() as u32);
                         }
                     }
+                    // `capture` is the upstream's own bytes, before any
+                    // filtering or renaming: the log stays the record of what
+                    // the backend actually said.
                     this.capture.extend_from_slice(&chunk);
-                    if !this.filter {
+                    // A chunk needs assembling into events only when
+                    // something downstream inspects them.
+                    if !this.filter && this.rename.is_none() {
                         return Poll::Ready(Some(Ok(chunk)));
                     }
                     this.pending.extend_from_slice(&chunk);
                     let mut out = Vec::new();
                     while let Some(end) = event_boundary(&this.pending) {
                         let event: Vec<u8> = this.pending.drain(..end).collect();
-                        if !is_usage_only_event(&event) {
-                            out.extend_from_slice(&event);
+                        if this.filter && is_usage_only_event(&event) {
+                            continue;
+                        }
+                        match &this.rename {
+                            Some((up, alias)) => match rewrite_model_sse(&event, up, alias) {
+                                Some(renamed) => out.extend_from_slice(&renamed),
+                                None => out.extend_from_slice(&event),
+                            },
+                            None => out.extend_from_slice(&event),
                         }
                     }
                     if !out.is_empty() {
@@ -1139,6 +1271,47 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("wound up in state stopped"));
+    }
+
+    #[test]
+    fn response_model_is_mapped_back_to_the_alias() {
+        let body = br#"{"model":"unsloth/Qwen3.5-9B-GGUF:q5_k_m","choices":[]}"#;
+        let out =
+            rewrite_model_json(body, "unsloth/Qwen3.5-9B-GGUF:q5_k_m", "gpgpu/qwen3-5").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "gpgpu/qwen3-5");
+        // An unrelated value is left alone, and so is a body that never
+        // mentions the backend's name.
+        assert!(rewrite_model_json(br#"{"model":"something-else"}"#, "up", "alias").is_none());
+        assert!(rewrite_model_json(b"not json", "up", "alias").is_none());
+        assert!(rewrite_model_json(br#"{"model":"same"}"#, "same", "same").is_none());
+    }
+
+    #[test]
+    fn embeddings_data_entries_are_mapped_too() {
+        let body = br#"{"object":"list","data":[{"model":"bge-up","embedding":[]}]}"#;
+        let out = rewrite_model_json(body, "bge-up", "gpgpu/bge").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["data"][0]["model"], "gpgpu/bge");
+    }
+
+    #[test]
+    fn sse_events_are_renamed_without_losing_framing() {
+        let event =
+            b"data: {\"model\":\"up-name\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let out = rewrite_model_sse(event, "up-name", "alias").unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("data: "), "{text}");
+        assert!(text.ends_with("\n\n"), "{text:?}");
+        assert!(text.contains("\"model\":\"alias\""), "{text}");
+        assert!(
+            text.contains("\"content\":\"hi\""),
+            "content must survive: {text}"
+        );
+        // The terminator event and anything not naming the model are
+        // untouched, so the cheap path stays cheap.
+        assert!(rewrite_model_sse(b"data: [DONE]\n\n", "up-name", "alias").is_none());
+        assert!(rewrite_model_sse(b"data: {\"choices\":[]}\n\n", "up-name", "alias").is_none());
     }
 
     #[test]
