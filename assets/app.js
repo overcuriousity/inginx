@@ -54,3 +54,59 @@
     if (!window.confirm(form.getAttribute('data-confirm'))) e.preventDefault();
   });
 })();
+
+// The model picker on the API-keys form: filter, live count, and the
+// "All models" interlock. The interlock's *visual* half is a CSS `:has()` rule
+// so the form is still honest with this file missing; what is here is the
+// convenience — picking a model turns "All models" off, and turning it back on
+// clears the picks, so the form never submits a contradiction.
+(function () {
+  var picker = document.querySelector('[data-model-picker]');
+  if (!picker) return;
+  var all = document.querySelector('[data-all-models]');
+  var filter = picker.querySelector('[data-model-filter]');
+  var count = picker.querySelector('[data-model-count]');
+  var clear = picker.querySelector('[data-model-clear]');
+  var boxes = Array.prototype.slice.call(picker.querySelectorAll('input[name="model_ids"]'));
+
+  function paint() {
+    var n = boxes.filter(function (b) { return b.checked; }).length;
+    count.textContent = n === 1 ? '1 selected' : n + ' selected';
+  }
+
+  picker.addEventListener('change', function (e) {
+    if (e.target.name !== 'model_ids') return;
+    if (e.target.checked && all) all.checked = false;
+    paint();
+  });
+
+  if (all) {
+    all.addEventListener('change', function () {
+      if (!all.checked) return;
+      boxes.forEach(function (b) { b.checked = false; });
+      paint();
+    });
+  }
+
+  if (clear) {
+    clear.addEventListener('click', function () {
+      boxes.forEach(function (b) { b.checked = false; });
+      paint();
+    });
+  }
+
+  if (filter) {
+    filter.addEventListener('input', function () {
+      var q = filter.value.trim().toLowerCase();
+      boxes.forEach(function (b) {
+        var row = b.parentElement;
+        var name = (row.getAttribute('data-model-name') || '').toLowerCase();
+        // A checked model stays visible: hiding it would hide a pick that is
+        // still going to be submitted.
+        row.hidden = q !== '' && !b.checked && name.indexOf(q) === -1;
+      });
+    });
+  }
+
+  paint();
+})();

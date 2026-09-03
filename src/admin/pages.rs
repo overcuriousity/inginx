@@ -323,10 +323,33 @@ pub async fn keys_page(State(st): State<AppState>) -> Response {
             form hx-post="/admin/keys" hx-target="#keys-area" hx-swap="outerHTML" {
                 label { "Name" }
                 input type="text" name="name" required placeholder="my-app";
-                label { input type="checkbox" name="all_models" checked; " All models" }
-                label { "Or select specific models" }
-                select name="model_ids" multiple size="5" {
-                    @for m in &models { option value=(m.id) { (m.alias) } }
+                label { input type="checkbox" name="all_models" checked data-all-models; " All models" }
+                // A native <select multiple> asked the operator to ctrl-click
+                // inside a five-row window; with a couple of dozen models that
+                // is a guessing game. Checkboxes say what is selected without
+                // being clicked, and the filter box makes a long list usable.
+                // While "All models" is checked the list is inert — that is a
+                // CSS `:has()` rule rather than a JS toggle, so the form still
+                // behaves correctly if app.js never loads.
+                div class="model-picker" data-model-picker {
+                    label for="model-filter" { "Or select specific models" }
+                    input type="search" id="model-filter" placeholder="Filter models…"
+                        autocomplete="off" data-model-filter;
+                    div class="model-picker__list" {
+                        @for m in &models {
+                            label class="model-option" data-model-name=(m.alias) {
+                                input type="checkbox" name="model_ids" value=(m.id);
+                                span { (m.alias) }
+                            }
+                        }
+                        @if models.is_empty() {
+                            p class="hint" { "No models yet — add a backend and import its models first." }
+                        }
+                    }
+                    div class="model-picker__foot" {
+                        span class="muted" data-model-count { "0 selected" }
+                        button type="button" class="ghost btn-sm" data-model-clear { "Clear" }
+                    }
                 }
                 label { "Expires after (days, empty = never)" }
                 input type="number" name="expires_days" min="1" placeholder="never";
