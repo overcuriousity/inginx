@@ -219,6 +219,14 @@ pub async fn key_stats_page(
     let all_time = usage::totals(&st.db, usage::range(Some("all")), &filter)
         .await
         .unwrap_or_default();
+    let models = match crate::registry::list_models(&st.db).await {
+        Ok(m) => m,
+        Err(e) => return err500(e),
+    };
+    let granted = match crate::keys::model_ids(&st.db, id).await {
+        Ok(g) => g,
+        Err(e) => return err500(e),
+    };
 
     let body = html! {
         div class="row page-head" {
@@ -236,6 +244,7 @@ pub async fn key_stats_page(
             " · all time: " (usage::fmt_count(all_time.total_tokens())) " tokens over "
             (usage::fmt_count(all_time.requests)) " requests"
         }
+        (crate::admin::pages::key_models_card(&key, &models, &granted, None))
         (range_picker(&format!("/admin/keys/{id}"), r))
         (measures(&totals, None))
         (charts(&format!("/admin/api/stats?range={}&key_id={id}", r.key), r.bucket_secs))

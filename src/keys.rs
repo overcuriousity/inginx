@@ -156,6 +156,48 @@ pub async fn rotate(db: &Db, id: i64) -> Result<String> {
     Ok(plain)
 }
 
+/// The models a key is explicitly granted. Empty for an `all_models` key —
+/// its grants are the absence of rows, not a row per model.
+pub async fn model_ids(db: &Db, key_id: i64) -> Result<Vec<i64>> {
+    db.call(move |c| {
+        let mut stmt =
+            c.prepare("SELECT model_id FROM key_models WHERE key_id = ?1 ORDER BY model_id")?;
+        let rows = stmt.query_map([key_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?)
+    })
+    .await
+}
+
+/// Rewrites a key's model scope in place, so a key's access can be widened or
+/// narrowed without issuing a new one. The grants are replaced, never merged:
+/// what the operator sees checked is what the key ends up with. An
+/// `all_models` key keeps no rows, so switching back to a selection starts
+/// from nothing rather than from stale grants.
+pub async fn set_models(db: &Db, key_id: i64, all_models: bool, model_ids: &[i64]) -> Result<()> {
+    let model_ids = if all_models {
+        Vec::new()
+    } else {
+        model_ids.to_vec()
+    };
+    db.call(move |c| {
+        let tx = c.transaction()?;
+        tx.execute(
+            "UPDATE api_keys SET all_models = ?1 WHERE id = ?2",
+            rusqlite::params![all_models as i64, key_id],
+        )?;
+        tx.execute("DELETE FROM key_models WHERE key_id = ?1", [key_id])?;
+        for mid in &model_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO key_models (key_id, model_id) VALUES (?1, ?2)",
+                rusqlite::params![key_id, mid],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 pub async fn key_allows_model(db: &Db, key: &ApiKey, model_id: i64) -> Result<bool> {
     if key.all_models {
         return Ok(true);
@@ -215,6 +257,45 @@ mod tests {
         assert!(authenticate(&db, &plain).await.unwrap().is_none());
         let expired = create(&db, "b", true, &[], Some(now() - 10)).await.unwrap();
         assert!(authenticate(&db, &expired).await.unwrap().is_none());
+    }
+
+    /// Adding a model to a key after it was issued, and taking one away,
+    /// without minting a new key.
+    #[tokio::test]
+    async fn set_models_replaces_grants() {
+        let db = testdb().await;
+        let b = crate::registry::add_backend(&db, "b", "http://x", None, true)
+            .await
+            .unwrap();
+        let m: Vec<i64> = {
+            let mut v = Vec::new();
+            for n in ["a", "b", "c"] {
+                v.push(crate::registry::add_model(&db, b, n, n).await.unwrap());
+            }
+            v
+        };
+        let plain = create(&db, "narrow", true, &[], None).await.unwrap();
+        let k = authenticate(&db, &plain).await.unwrap().unwrap();
+        assert!(model_ids(&db, k.id).await.unwrap().is_empty());
+
+        // all -> a specific pair
+        set_models(&db, k.id, false, &[m[0], m[1]]).await.unwrap();
+        let k = authenticate(&db, &plain).await.unwrap().unwrap();
+        assert!(!k.all_models);
+        assert_eq!(model_ids(&db, k.id).await.unwrap(), vec![m[0], m[1]]);
+        assert!(key_allows_model(&db, &k, m[0]).await.unwrap());
+        assert!(!key_allows_model(&db, &k, m[2]).await.unwrap());
+
+        // narrowing replaces the grants rather than adding to them
+        set_models(&db, k.id, false, &[m[2]]).await.unwrap();
+        assert_eq!(model_ids(&db, k.id).await.unwrap(), vec![m[2]]);
+
+        // widening back to all clears the rows, so a later narrowing starts clean
+        set_models(&db, k.id, true, &[]).await.unwrap();
+        let k = authenticate(&db, &plain).await.unwrap().unwrap();
+        assert!(k.all_models);
+        assert!(model_ids(&db, k.id).await.unwrap().is_empty());
+        assert!(key_allows_model(&db, &k, m[2]).await.unwrap());
     }
 
     #[tokio::test]

@@ -7,8 +7,10 @@ the common single-operator case:
 - **100% OpenAI-compatible API** toward clients — chat, completions,
   embeddings, TTS, STT, images, plus Jina/Cohere-style `/v1/rerank`. Unknown
   `/v1/*` routes are transparently proxied to your default backend.
-- **API key management** in a web GUI: create, scope to models, revoke,
-  rotate. Keys are hashed (SHA-256); the plaintext is shown exactly once.
+- **API key management** in a web GUI: create, revoke, rotate, and scope to
+  models — a key's model set stays editable after it was issued, so widening
+  or narrowing access does not mean handing out a new key. Keys are hashed
+  (SHA-256); the plaintext is shown exactly once.
 - **Exact usage metering**: inginx trusts the `usage` object your backend
   reports. For streams where the client didn't ask for usage, inginx injects
   `stream_options.include_usage` upstream and silently strips the extra chunk

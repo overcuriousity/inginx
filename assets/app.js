@@ -55,58 +55,72 @@
   });
 })();
 
-// The model picker on the API-keys form: filter, live count, and the
-// "All models" interlock. The interlock's *visual* half is a CSS `:has()` rule
-// so the form is still honest with this file missing; what is here is the
-// convenience — picking a model turns "All models" off, and turning it back on
-// clears the picks, so the form never submits a contradiction.
+// The model picker: filter, live count, and the "All models" interlock. The
+// interlock's *visual* half is a CSS `:has()` rule so the form is still honest
+// with this file missing; what is here is the convenience — picking a model
+// turns "All models" off, and turning it back on clears the picks, so the form
+// never submits a contradiction.
+//
+// There is one picker on the key-creation form and one on each key's model
+// access card, and the card is swapped out by htmx when it saves, so this
+// binds per picker and re-binds after every swap rather than once at load.
 (function () {
-  var picker = document.querySelector('[data-model-picker]');
-  if (!picker) return;
-  var all = document.querySelector('[data-all-models]');
-  var filter = picker.querySelector('[data-model-filter]');
-  var count = picker.querySelector('[data-model-count]');
-  var clear = picker.querySelector('[data-model-clear]');
-  var boxes = Array.prototype.slice.call(picker.querySelectorAll('input[name="model_ids"]'));
+  function wire(picker) {
+    if (picker.dataset.pickerWired) return;
+    picker.dataset.pickerWired = '1';
+    var form = picker.closest('form') || document;
+    var all = form.querySelector('[data-all-models]');
+    var filter = picker.querySelector('[data-model-filter]');
+    var count = picker.querySelector('[data-model-count]');
+    var clear = picker.querySelector('[data-model-clear]');
+    var boxes = Array.prototype.slice.call(picker.querySelectorAll('input[name="model_ids"]'));
 
-  function paint() {
-    var n = boxes.filter(function (b) { return b.checked; }).length;
-    count.textContent = n === 1 ? '1 selected' : n + ' selected';
-  }
+    function paint() {
+      var n = boxes.filter(function (b) { return b.checked; }).length;
+      if (count) count.textContent = n === 1 ? '1 selected' : n + ' selected';
+    }
 
-  picker.addEventListener('change', function (e) {
-    if (e.target.name !== 'model_ids') return;
-    if (e.target.checked && all) all.checked = false;
-    paint();
-  });
-
-  if (all) {
-    all.addEventListener('change', function () {
-      if (!all.checked) return;
-      boxes.forEach(function (b) { b.checked = false; });
+    picker.addEventListener('change', function (e) {
+      if (e.target.name !== 'model_ids') return;
+      if (e.target.checked && all) all.checked = false;
       paint();
     });
-  }
 
-  if (clear) {
-    clear.addEventListener('click', function () {
-      boxes.forEach(function (b) { b.checked = false; });
-      paint();
-    });
-  }
-
-  if (filter) {
-    filter.addEventListener('input', function () {
-      var q = filter.value.trim().toLowerCase();
-      boxes.forEach(function (b) {
-        var row = b.parentElement;
-        var name = (row.getAttribute('data-model-name') || '').toLowerCase();
-        // A checked model stays visible: hiding it would hide a pick that is
-        // still going to be submitted.
-        row.hidden = q !== '' && !b.checked && name.indexOf(q) === -1;
+    if (all) {
+      all.addEventListener('change', function () {
+        if (!all.checked) return;
+        boxes.forEach(function (b) { b.checked = false; });
+        paint();
       });
-    });
+    }
+
+    if (clear) {
+      clear.addEventListener('click', function () {
+        boxes.forEach(function (b) { b.checked = false; });
+        paint();
+      });
+    }
+
+    if (filter) {
+      filter.addEventListener('input', function () {
+        var q = filter.value.trim().toLowerCase();
+        boxes.forEach(function (b) {
+          var row = b.parentElement;
+          var name = (row.getAttribute('data-model-name') || '').toLowerCase();
+          // A checked model stays visible: hiding it would hide a pick that is
+          // still going to be submitted.
+          row.hidden = q !== '' && !b.checked && name.indexOf(q) === -1;
+        });
+      });
+    }
+
+    paint();
   }
 
-  paint();
+  function wireAll() {
+    Array.prototype.forEach.call(document.querySelectorAll('[data-model-picker]'), wire);
+  }
+
+  wireAll();
+  document.body.addEventListener('htmx:afterSwap', wireAll);
 })();

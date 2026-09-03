@@ -368,6 +368,88 @@ pub fn keys_area(rows: &[KeyRow], new_key: Option<&str>) -> Markup {
     }
 }
 
+/// The checkbox list of models shared by the create form and a key's model
+/// access card.
+///
+/// A native `<select multiple>` asked the operator to ctrl-click inside a
+/// five-row window; with a couple of dozen models that is a guessing game.
+/// Checkboxes say what is selected without being clicked, and the filter box
+/// makes a long list usable. While "All models" is checked the list is inert —
+/// that is a CSS `:has()` rule rather than a JS toggle, so the form still
+/// behaves correctly if app.js never loads.
+///
+/// `filter_id` keeps the two instances' label/input pairs distinct, since both
+/// can be on the page at once.
+fn model_picker(models: &[crate::registry::Model], selected: &[i64], filter_id: &str) -> Markup {
+    let n = selected.len();
+    html! {
+        div class="model-picker" data-model-picker {
+            label for=(filter_id) { "Or select specific models" }
+            input type="search" id=(filter_id) placeholder="Filter models…"
+                autocomplete="off" data-model-filter;
+            div class="model-picker__list" {
+                @for m in models {
+                    label class="model-option" data-model-name=(m.alias) {
+                        input type="checkbox" name="model_ids" value=(m.id)
+                            checked[selected.contains(&m.id)];
+                        span { (m.alias) }
+                    }
+                }
+                @if models.is_empty() {
+                    p class="hint" { "No models yet — add a backend and import its models first." }
+                }
+            }
+            div class="model-picker__foot" {
+                span class="muted" data-model-count { (n) " selected" }
+                button type="button" class="ghost btn-sm" data-model-clear { "Clear" }
+            }
+        }
+    }
+}
+
+/// The swap target for editing one key's model scope. A key's grants outlive
+/// the moment it was issued — the models an app needs change — so the same
+/// picker used at creation is offered here, without rotating the key.
+pub fn key_models_card(
+    key: &KeyRow,
+    models: &[crate::registry::Model],
+    granted: &[i64],
+    notice: Option<&str>,
+) -> Markup {
+    html! {
+        div id="key-models" class="card" {
+            h2 { "Model access" }
+            @if let Some(n) = notice {
+                p class="hint" { (n) }
+            }
+            @if key.revoked_at.is_some() {
+                // Nothing this key is allowed to reach matters any more; an
+                // editable form would only invite pointless saves.
+                p class="hint" { "This key is revoked." }
+                p {
+                    @if key.all_models { "Had access to all models." }
+                    @else if granted.is_empty() { "Had access to no models." }
+                    @else {
+                        "Had access to: "
+                        (models.iter().filter(|m| granted.contains(&m.id))
+                            .map(|m| m.alias.as_str()).collect::<Vec<_>>().join(", "))
+                    }
+                }
+            } @else {
+                form hx-post=(format!("/admin/keys/{}/models", key.id))
+                    hx-target="#key-models" hx-swap="outerHTML" {
+                    label {
+                        input type="checkbox" name="all_models" checked[key.all_models] data-all-models;
+                        " All models"
+                    }
+                    (model_picker(models, granted, "key-model-filter"))
+                    button type="submit" class="primary" { "Save access" }
+                }
+            }
+        }
+    }
+}
+
 pub async fn keys_page(State(st): State<AppState>) -> Response {
     let rows = match key_rows(&st.db).await {
         Ok(r) => r,
@@ -384,33 +466,7 @@ pub async fn keys_page(State(st): State<AppState>) -> Response {
                 label { "Name" }
                 input type="text" name="name" required placeholder="my-app";
                 label { input type="checkbox" name="all_models" checked data-all-models; " All models" }
-                // A native <select multiple> asked the operator to ctrl-click
-                // inside a five-row window; with a couple of dozen models that
-                // is a guessing game. Checkboxes say what is selected without
-                // being clicked, and the filter box makes a long list usable.
-                // While "All models" is checked the list is inert — that is a
-                // CSS `:has()` rule rather than a JS toggle, so the form still
-                // behaves correctly if app.js never loads.
-                div class="model-picker" data-model-picker {
-                    label for="model-filter" { "Or select specific models" }
-                    input type="search" id="model-filter" placeholder="Filter models…"
-                        autocomplete="off" data-model-filter;
-                    div class="model-picker__list" {
-                        @for m in &models {
-                            label class="model-option" data-model-name=(m.alias) {
-                                input type="checkbox" name="model_ids" value=(m.id);
-                                span { (m.alias) }
-                            }
-                        }
-                        @if models.is_empty() {
-                            p class="hint" { "No models yet — add a backend and import its models first." }
-                        }
-                    }
-                    div class="model-picker__foot" {
-                        span class="muted" data-model-count { "0 selected" }
-                        button type="button" class="ghost btn-sm" data-model-clear { "Clear" }
-                    }
-                }
+                (model_picker(&models, &[], "model-filter"))
                 label { "Expires after (days, empty = never)" }
                 input type="number" name="expires_days" min="1" placeholder="never";
                 button type="submit" class="primary" { "Create key" }

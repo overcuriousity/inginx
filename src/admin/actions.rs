@@ -1,4 +1,4 @@
-use super::pages::{err500, key_rows, keys_area};
+use super::pages::{err500, key_models_card, key_row, key_rows, keys_area};
 use crate::db::now;
 use crate::keys;
 use crate::proxy::AppState;
@@ -48,6 +48,53 @@ pub async fn create_key(State(st): State<AppState>, RawForm(body): RawForm) -> R
         Err(e) => return err500(e),
     };
     render_area(&st, Some(&plain)).await
+}
+
+/// Rewrites which models an existing key may reach.
+pub async fn set_key_models(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    RawForm(body): RawForm,
+) -> Response {
+    let fields = form_fields(&body);
+    let model_ids: Vec<i64> = fields
+        .iter()
+        .filter(|(k, _)| k == "model_ids")
+        .filter_map(|(_, v)| v.parse().ok())
+        .collect();
+    let all_models = fields.iter().any(|(k, _)| k == "all_models");
+    // `create_key` reads an empty selection as "all models", which is a
+    // reasonable default for a key that does not exist yet. Here the same
+    // reading would silently widen a key the operator was trying to narrow,
+    // so it is refused instead.
+    if !all_models && model_ids.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "select at least one model, or check All models",
+        )
+            .into_response();
+    }
+    if let Err(e) = keys::set_models(&st.db, id, all_models, &model_ids).await {
+        return err500(e);
+    }
+    render_key_models(&st, id, Some("Saved.")).await
+}
+
+async fn render_key_models(st: &AppState, id: i64, notice: Option<&str>) -> Response {
+    let key = match key_row(&st.db, id).await {
+        Ok(Some(k)) => k,
+        Ok(None) => return (axum::http::StatusCode::NOT_FOUND, "no such key").into_response(),
+        Err(e) => return err500(e),
+    };
+    let models = match registry::list_models(&st.db).await {
+        Ok(m) => m,
+        Err(e) => return err500(e),
+    };
+    let granted = match keys::model_ids(&st.db, id).await {
+        Ok(g) => g,
+        Err(e) => return err500(e),
+    };
+    Html(key_models_card(&key, &models, &granted, notice).into_string()).into_response()
 }
 
 pub async fn revoke_key(State(st): State<AppState>, Path(id): Path<i64>) -> Response {

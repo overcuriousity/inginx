@@ -18,6 +18,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/keys/{id}", get(dashboard::key_stats_page))
         .route("/admin/keys/{id}/revoke", post(actions::revoke_key))
         .route("/admin/keys/{id}/rotate", post(actions::rotate_key))
+        .route("/admin/keys/{id}/models", post(actions::set_key_models))
         .route(
             "/admin/backends",
             get(pages::backends_page).post(actions::add_backend),
@@ -167,6 +168,90 @@ mod tests {
             .await
             .unwrap();
         assert!(revoked.is_some());
+    }
+
+    /// The set of models a key may reach is editable after the key was
+    /// issued — the operator should not have to rotate a key to widen or
+    /// narrow it.
+    #[tokio::test]
+    async fn key_model_scope_is_editable() {
+        let (st, app, cookie) = logged_in().await;
+        let b = crate::registry::add_backend(&st.db, "b", "http://x", None, true)
+            .await
+            .unwrap();
+        let m1 = crate::registry::add_model(&st.db, b, "qwen3-8b", "qwen3-8b")
+            .await
+            .unwrap();
+        let m2 = crate::registry::add_model(&st.db, b, "bge-m3", "bge-m3")
+            .await
+            .unwrap();
+
+        post_form(&app, "/admin/keys", "name=test&all_models=on", &cookie).await;
+        let id: i64 = st
+            .db
+            .call(|c| Ok(c.query_row("SELECT id FROM api_keys", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+
+        // The key's page offers the picker.
+        let (status, body) = get_page(&app, &format!("/admin/keys/{id}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Model access"), "{body}");
+        assert!(body.contains("qwen3-8b"), "{body}");
+
+        // Narrow an all-models key to one model.
+        let (status, body) = post_form(
+            &app,
+            &format!("/admin/keys/{id}/models"),
+            &format!("model_ids={m1}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Model access"), "swaps the card back: {body}");
+        assert_eq!(
+            crate::keys::model_ids(&st.db, id).await.unwrap(),
+            vec![m1],
+            "grant narrowed"
+        );
+
+        // Swap one model for another.
+        post_form(
+            &app,
+            &format!("/admin/keys/{id}/models"),
+            &format!("model_ids={m2}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(crate::keys::model_ids(&st.db, id).await.unwrap(), vec![m2]);
+
+        // An empty selection with "All models" unchecked would silently widen
+        // the key, so it is refused rather than guessed at.
+        let (status, _) = post_form(&app, &format!("/admin/keys/{id}/models"), "", &cookie).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(crate::keys::model_ids(&st.db, id).await.unwrap(), vec![m2]);
+
+        // Widening back to all models drops the rows.
+        post_form(
+            &app,
+            &format!("/admin/keys/{id}/models"),
+            "all_models=on",
+            &cookie,
+        )
+        .await;
+        assert!(crate::keys::model_ids(&st.db, id).await.unwrap().is_empty());
+        let all: i64 = st
+            .db
+            .call(move |c| {
+                Ok(
+                    c.query_row("SELECT all_models FROM api_keys WHERE id = ?1", [id], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(all, 1);
     }
 
     #[tokio::test]
