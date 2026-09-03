@@ -334,7 +334,7 @@ pub fn keys_area(rows: &[KeyRow], new_key: Option<&str>) -> Markup {
                             // buttons alone.
                             tr class="clickable" data-href=(format!("/admin/keys/{}", k.id)) {
                                 td { (k.name) }
-                                td class="mono" { "igx_" (k.key_prefix) "…" }
+                                td class="mono" { (crate::keys::display_prefix(&k.key_prefix)) }
                                 td { @if k.all_models { "all" } @else { (k.n_models) } }
                                 td { (fmt_ts(k.created_at)) }
                                 td { @if let Some(e) = k.expires_at { (fmt_ts(e)) } @else { "—" } }

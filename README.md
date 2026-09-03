@@ -68,12 +68,12 @@ $ ./target/release/inginx
    (the OpenAI-compatible base **including** `/v1`), then **Import from
    /models** to bulk-add its models. Edit aliases as you like — the alias is
    the public model name.
-3. *API Keys* → create a key, pick its models, copy the `igx_…` secret.
+3. *API Keys* → create a key, pick its models, copy the `sk_…` secret.
 4. Point any OpenAI client at inginx:
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="https://ai.example.com/v1", api_key="igx_...")
+client = OpenAI(base_url="https://ai.example.com/v1", api_key="sk_...")
 client.chat.completions.create(model="qwen3-8b", messages=[...])
 ```
 

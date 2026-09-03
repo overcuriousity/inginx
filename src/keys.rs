@@ -12,12 +12,34 @@ pub struct ApiKey {
 
 const BASE62: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
+/// Keys are minted as `sk_…`. The scheme carries no meaning to inginx — a key
+/// is authenticated by the hash of the whole string — but enough clients
+/// hard-code a check for OpenAI's prefix that anything else is a support
+/// burden. Keys issued before this (`igx_…`) keep working: nothing here
+/// parses the prefix.
+pub const KEY_PREFIX: &str = "sk_";
+
+/// How many characters of the random body are stored in the clear, for
+/// telling keys apart in the GUI.
+const PREFIX_CHARS: usize = 8;
+
 fn random_key() -> String {
     let mut rng = rand::rng();
     let body: String = (0..40)
         .map(|_| BASE62[rng.random_range(0..BASE62.len())] as char)
         .collect();
-    format!("igx_{body}")
+    format!("{KEY_PREFIX}{body}")
+}
+
+/// How a stored prefix is shown. New rows hold the whole issued prefix
+/// (`sk_AbCd1234`); rows written before keys carried their scheme hold only
+/// the eight body characters, and those were all `igx_`.
+pub fn display_prefix(stored: &str) -> String {
+    if stored.contains('_') {
+        format!("{stored}…")
+    } else {
+        format!("igx_{stored}…")
+    }
 }
 
 pub fn hash_key(plain: &str) -> String {
@@ -33,7 +55,10 @@ pub async fn create(
 ) -> Result<String> {
     let plain = random_key();
     let hash = hash_key(&plain);
-    let prefix: String = plain[4..12].to_string();
+    // Stored with its scheme, so the GUI can show a key exactly as it was
+    // issued — including the older `igx_` keys, whose rows hold the bare
+    // eight characters and are rendered by `display_prefix`.
+    let prefix: String = plain[..KEY_PREFIX.len() + PREFIX_CHARS].to_string();
     let name = name.to_string();
     let model_ids = model_ids.to_vec();
     db.call(move |c| {
@@ -98,7 +123,10 @@ pub async fn revoke(db: &Db, id: i64) -> Result<()> {
 pub async fn rotate(db: &Db, id: i64) -> Result<String> {
     let plain = random_key();
     let hash = hash_key(&plain);
-    let prefix: String = plain[4..12].to_string();
+    // Stored with its scheme, so the GUI can show a key exactly as it was
+    // issued — including the older `igx_` keys, whose rows hold the bare
+    // eight characters and are rendered by `display_prefix`.
+    let prefix: String = plain[..KEY_PREFIX.len() + PREFIX_CHARS].to_string();
     db.call(move |c| {
         let tx = c.transaction()?;
         let (name, all_models, expires_at): (String, i64, Option<i64>) = tx.query_row(
@@ -160,12 +188,22 @@ mod tests {
     async fn create_and_authenticate() {
         let db = testdb().await;
         let plain = create(&db, "ci", true, &[], None).await.unwrap();
-        assert!(plain.starts_with("igx_"));
-        assert_eq!(plain.len(), 4 + 40);
+        assert!(plain.starts_with("sk_"), "{plain}");
+        assert_eq!(plain.len(), KEY_PREFIX.len() + 40);
+        // The stored prefix keeps its scheme, so the GUI shows the key the
+        // way it was issued.
+        let stored: String = db
+            .call(|c| Ok(c.query_row("SELECT key_prefix FROM api_keys", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert!(plain.starts_with(&stored), "{stored} vs {plain}");
+        assert_eq!(display_prefix(&stored), format!("{stored}…"));
+        // A key from before the scheme was stored still renders correctly.
+        assert_eq!(display_prefix("AbCd1234"), "igx_AbCd1234…");
         let k = authenticate(&db, &plain).await.unwrap().unwrap();
         assert_eq!(k.name, "ci");
         assert!(k.all_models);
-        assert!(authenticate(&db, "igx_wrong").await.unwrap().is_none());
+        assert!(authenticate(&db, "sk_wrong").await.unwrap().is_none());
     }
 
     #[tokio::test]

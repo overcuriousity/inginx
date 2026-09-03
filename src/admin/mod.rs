@@ -143,7 +143,7 @@ mod tests {
         let (status, body) =
             post_form(&app, "/admin/keys", "name=test&all_models=on", &cookie).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("igx_"), "plaintext key shown once: {body}");
+        assert!(body.contains("sk_"), "plaintext key shown once: {body}");
 
         let id: i64 = st
             .db

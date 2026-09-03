@@ -223,7 +223,7 @@ pub async fn key_stats_page(
     let body = html! {
         div class="row page-head" {
             h2 { (key.name) }
-            span class="badge mono" { "igx_" (key.key_prefix) "…" }
+            span class="badge mono" { (crate::keys::display_prefix(&key.key_prefix)) }
             @if key.revoked_at.is_some() { span class="badge badge-danger" { "revoked" } }
             @else { span class="badge badge-success" { "active" } }
             a class="btn btn-sm" href=(format!("/admin/logs?key={id}")) { "Requests" }
