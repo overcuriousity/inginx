@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS backends (
 CREATE TABLE IF NOT EXISTS models (
   id INTEGER PRIMARY KEY, backend_id INTEGER NOT NULL REFERENCES backends(id) ON DELETE CASCADE,
   upstream_name TEXT NOT NULL, alias TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1,
-  voice_map TEXT, created_at INTEGER NOT NULL DEFAULT 0);
+  voice_map TEXT, created_at INTEGER NOT NULL DEFAULT 0, upstream_path TEXT);
 CREATE TABLE IF NOT EXISTS api_keys (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL,
   all_models INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("models", "voice_map", "TEXT"),
     ("models", "created_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("models", "upstream_path", "TEXT"),
 ];
 
 fn add_missing_columns(conn: &Connection) -> Result<()> {

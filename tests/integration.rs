@@ -82,6 +82,14 @@ async fn spawn_mock_upstream() -> SocketAddr {
     let app = Router::new()
         .route("/chat/completions", post(mock_chat))
         .route("/hang", post(mock_hang))
+        // A backend that speaks the OpenAI body at a path of its own.
+        .route(
+            "/inference",
+            post(|body: axum::body::Bytes| async move {
+                let seen = String::from_utf8_lossy(&body).contains("m-upstream");
+                Json(serde_json::json!({"text":"custom path", "model_rewritten": seen}))
+            }),
+        )
         // One chunk, then silence: a stream that stalls mid-flight.
         .route(
             "/stall",
@@ -918,4 +926,25 @@ async fn the_client_never_sees_the_backends_model_name() {
         logged_upstream,
         "the log is the record of what the backend actually said"
     );
+}
+
+#[tokio::test]
+async fn a_model_can_be_pointed_at_its_own_upstream_path() {
+    // whisper.cpp on /inference: OpenAI body, non-OpenAI path.
+    let ctx = setup().await;
+    registry::set_model_upstream_path(&ctx.db, 1, Some("/inference".into()))
+        .await
+        .unwrap();
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("http://{}/v1/audio/transcriptions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["text"], "custom path");
+    assert_eq!(v["model_rewritten"], true, "the alias is still translated");
 }

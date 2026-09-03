@@ -219,6 +219,25 @@ pub async fn set_model_voices(
     }
 }
 
+/// Sets a model's upstream path override; an empty field clears it.
+pub async fn set_model_path(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    RawForm(body): RawForm,
+) -> Response {
+    let fields = form_fields(&body);
+    let raw = fields
+        .iter()
+        .find(|(k, _)| k == "upstream_path")
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_default();
+    let path = (!raw.is_empty()).then_some(raw);
+    match registry::set_model_upstream_path(&st.db, id, path).await {
+        Ok(()) => render_backends(&st, None).await,
+        Err(e) => render_backends(&st, Some(format!("Upstream path update failed: {e}"))).await,
+    }
+}
+
 async fn render_area(st: &AppState, new_key: Option<&str>) -> Response {
     match key_rows(&st.db).await {
         Ok(rows) => Html(keys_area(&rows, new_key).into_string()).into_response(),

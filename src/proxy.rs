@@ -589,6 +589,40 @@ pub(crate) fn rewrite_model_sse(event: &[u8], upstream: &str, alias: &str) -> Op
     changed.then(|| out.into_bytes())
 }
 
+/// Where a request is sent under the backend's base URL.
+///
+/// By default that is the client's own path with its `/v1` prefix removed,
+/// which is what an OpenAI-compatible backend expects. A model may override
+/// it, which is how a backend that speaks the OpenAI *body* at a path of its
+/// own choosing — whisper.cpp on `/inference`, a service behind `/api/v2/chat`
+/// — is reached without any translation. Two placeholders are substituted:
+/// `{model}` (the upstream model name) and `{path}` (the default suffix,
+/// query string included), so an override can extend the default rather than
+/// replace it.
+pub(crate) fn upstream_suffix(
+    path_and_query: &str,
+    override_path: Option<&str>,
+    upstream_model: Option<&str>,
+) -> String {
+    let default = path_and_query
+        .strip_prefix("/v1")
+        .unwrap_or(path_and_query)
+        .to_string();
+    let Some(template) = override_path.map(str::trim).filter(|t| !t.is_empty()) else {
+        return default;
+    };
+    let rendered = template
+        .replace("{path}", &default)
+        .replace("{model}", upstream_model.unwrap_or_default());
+    // A backend URL is `base + suffix`, so the suffix must start with a
+    // slash however the operator typed it.
+    if rendered.starts_with('/') {
+        rendered
+    } else {
+        format!("/{rendered}")
+    }
+}
+
 pub async fn proxy_handler(
     State(st): State<AppState>,
     Extension(key): Extension<ApiKey>,
@@ -610,7 +644,7 @@ pub async fn proxy_handler(
         .unwrap_or("")
         .to_string();
     let model_alias = extract_model(&body, &content_type);
-    let (upstream_model, voice_map, backend, model_alias) = match &model_alias {
+    let (upstream_model, voice_map, upstream_path, backend, model_alias) = match &model_alias {
         Some(alias) => {
             match registry::resolve(&st.db, alias).await {
                 Ok(Some((model, backend))) => {
@@ -618,6 +652,7 @@ pub async fn proxy_handler(
                     Ok(true) => (
                         Some(model.upstream_name),
                         model.voice_map,
+                        model.upstream_path,
                         backend,
                         Some(alias.clone()),
                     ),
@@ -654,7 +689,7 @@ pub async fn proxy_handler(
             }
         }
         None => match registry::default_backend(&st.db).await {
-            Ok(Some(b)) => (None, None, b, None),
+            Ok(Some(b)) => (None, None, None, b, None),
             Ok(None) => {
                 return openai_error(
                     StatusCode::BAD_GATEWAY,
@@ -699,13 +734,15 @@ pub async fn proxy_handler(
         }
     }
 
-    // base_url is the OpenAI-compatible base including `/v1`; forward the
-    // request path with its `/v1` prefix stripped.
     let path_and_query = uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(&endpoint);
-    let suffix = path_and_query.strip_prefix("/v1").unwrap_or(path_and_query);
+    let suffix = upstream_suffix(
+        path_and_query,
+        upstream_path.as_deref(),
+        upstream_model.as_deref(),
+    );
     let url = format!("{}{}", backend.base_url, suffix);
 
     let mut req = st
@@ -1271,6 +1308,42 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("wound up in state stopped"));
+    }
+
+    #[test]
+    fn upstream_path_defaults_to_the_client_path_without_v1() {
+        assert_eq!(
+            upstream_suffix("/v1/chat/completions", None, None),
+            "/chat/completions"
+        );
+        assert_eq!(
+            upstream_suffix("/v1/models?limit=2", None, None),
+            "/models?limit=2"
+        );
+        // An empty override is the same as no override.
+        assert_eq!(upstream_suffix("/v1/x", Some("  "), None), "/x");
+    }
+
+    #[test]
+    fn upstream_path_override_and_placeholders() {
+        // A backend that puts the OpenAI body somewhere else entirely.
+        assert_eq!(
+            upstream_suffix("/v1/audio/transcriptions", Some("/inference"), None),
+            "/inference"
+        );
+        // Missing leading slash is the operator's typo, not an error.
+        assert_eq!(
+            upstream_suffix("/v1/x", Some("api/generate"), None),
+            "/api/generate"
+        );
+        assert_eq!(
+            upstream_suffix(
+                "/v1/chat/completions",
+                Some("/models/{model}{path}"),
+                Some("qwen3")
+            ),
+            "/models/qwen3/chat/completions"
+        );
     }
 
     #[test]

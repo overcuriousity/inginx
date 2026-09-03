@@ -470,6 +470,7 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                         thead { tr {
                             th { "Alias (public)" } th { "Upstream name" }
                             th title="Rewrites the `voice` field of /v1/audio/speech before forwarding" { "Voice map" }
+                            th title="Send this model's requests to a path of your choosing instead of the client's" { "Upstream path" }
                             th { "Status" } th {}
                         } }
                         tbody {
@@ -499,6 +500,20 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                                                 value=(crate::proxy::format_voice_map(m.voice_map.as_deref()))
                                                 class="alias-input voice-input" placeholder="alloy=af_alloy, nova=af_nova"
                                                 title="Comma-separated from=to pairs";
+                                            button type="submit" class="ghost btn-sm" { "Save" }
+                                        }
+                                    }
+                                    // For a backend that speaks the OpenAI
+                                    // body at a path of its own — whisper.cpp
+                                    // on /inference, a service behind
+                                    // /api/v2/chat.
+                                    td {
+                                        form class="cell-form" hx-post=(format!("/admin/models/{}/path", m.id))
+                                            hx-target="#backends-area" hx-swap="outerHTML" {
+                                            input type="text" name="upstream_path"
+                                                value=(m.upstream_path.clone().unwrap_or_default())
+                                                class="alias-input voice-input" placeholder="(default) /chat/completions"
+                                                title="Empty = the client's path without /v1. {model} and {path} are substituted.";
                                             button type="submit" class="ghost btn-sm" { "Save" }
                                         }
                                     }

@@ -120,6 +120,22 @@ the database.
 - Failed `/v1` authentications are logged and rate-limited per source IP, on
   the same doubling lockout as the admin login.
 
+### Upstream paths
+
+By default a request to `/v1/foo` is forwarded to `{base_url}/foo`, which is
+what an OpenAI-compatible backend expects. A model can override the path it
+is sent to, in *Backends* beside its alias — enough to attach a backend that
+speaks the OpenAI **body** at a path of its own:
+
+```
+/inference                 # whisper.cpp with --inference-path ""
+/api/v2/chat               # a service behind its own prefix
+/models/{model}{path}      # {model} = upstream name, {path} = the default
+```
+
+Leave it empty for the default. This covers path differences only; a backend
+whose request or response *schema* differs is not yet supported.
+
 ### Voice maps
 
 Backends name TTS voices their own way — Kokoro wants `af_alloy`, Piper wants

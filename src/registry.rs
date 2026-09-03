@@ -28,6 +28,13 @@ pub struct Model {
     /// Unix seconds. Reported as `created` on `/v1/models`, which some clients
     /// require to be present. Rows written before this column existed carry 0.
     pub created_at: i64,
+    /// Optional override for the path this model's requests are sent to,
+    /// replacing the default "the client's path, minus `/v1`". A backend that
+    /// speaks the OpenAI *body* but puts it somewhere else — whisper.cpp on
+    /// `/inference`, a service behind `/api/v2/chat` — is reachable with this
+    /// alone. `{model}` and `{path}` are substituted; see
+    /// `proxy::upstream_suffix`.
+    pub upstream_path: Option<String>,
 }
 
 fn backend_from_row(r: &rusqlite::Row) -> rusqlite::Result<Backend> {
@@ -52,10 +59,12 @@ fn model_from_row(r: &rusqlite::Row) -> rusqlite::Result<Model> {
         enabled: r.get::<_, i64>(4)? != 0,
         voice_map: r.get(5)?,
         created_at: r.get(6)?,
+        upstream_path: r.get(7)?,
     })
 }
 
-const MODEL_COLS: &str = "id, backend_id, upstream_name, alias, enabled, voice_map, created_at";
+const MODEL_COLS: &str =
+    "id, backend_id, upstream_name, alias, enabled, voice_map, created_at, upstream_path";
 
 pub async fn add_backend(
     db: &Db,
@@ -117,7 +126,7 @@ pub async fn resolve(db: &Db, alias: &str) -> Result<Option<(Model, Backend)>> {
     db.call(move |c| {
         let mut stmt = c.prepare(
             "SELECT m.id, m.backend_id, m.upstream_name, m.alias, m.enabled,
-                    m.voice_map, m.created_at,
+                    m.voice_map, m.created_at, m.upstream_path,
                     b.id, b.name, b.base_url, b.upstream_api_key, b.enabled, b.is_default
              FROM models m JOIN backends b ON b.id = m.backend_id
              WHERE m.alias = ?1 AND m.enabled = 1 AND b.enabled = 1",
@@ -133,14 +142,15 @@ pub async fn resolve(db: &Db, alias: &str) -> Result<Option<(Model, Backend)>> {
                         enabled: r.get::<_, i64>(4)? != 0,
                         voice_map: r.get(5)?,
                         created_at: r.get(6)?,
+                        upstream_path: r.get(7)?,
                     },
                     Backend {
-                        id: r.get(7)?,
-                        name: r.get(8)?,
-                        base_url: r.get(9)?,
-                        upstream_api_key: r.get(10)?,
-                        enabled: r.get::<_, i64>(11)? != 0,
-                        is_default: r.get::<_, i64>(12)? != 0,
+                        id: r.get(8)?,
+                        name: r.get(9)?,
+                        base_url: r.get(10)?,
+                        upstream_api_key: r.get(11)?,
+                        enabled: r.get::<_, i64>(12)? != 0,
+                        is_default: r.get::<_, i64>(13)? != 0,
                     },
                 ))
             })
@@ -199,7 +209,7 @@ pub async fn models_for_key(db: &Db, key: &ApiKey) -> Result<Vec<Model>> {
             )
         } else {
             "SELECT m.id, m.backend_id, m.upstream_name, m.alias, m.enabled,
-                    m.voice_map, m.created_at FROM models m
+                    m.voice_map, m.created_at, m.upstream_path FROM models m
              JOIN key_models km ON km.model_id = m.id AND km.key_id = ?1
              JOIN backends b ON b.id = m.backend_id AND b.enabled = 1
              WHERE m.enabled = 1 ORDER BY m.alias"
@@ -249,6 +259,18 @@ pub async fn set_model_voice_map(db: &Db, model_id: i64, map: Option<String>) ->
         c.execute(
             "UPDATE models SET voice_map = ?1 WHERE id = ?2",
             rusqlite::params![map, model_id],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// Sets (or clears) a model's upstream path override.
+pub async fn set_model_upstream_path(db: &Db, model_id: i64, path: Option<String>) -> Result<()> {
+    db.call(move |c| {
+        c.execute(
+            "UPDATE models SET upstream_path = ?1 WHERE id = ?2",
+            rusqlite::params![path, model_id],
         )?;
         Ok(())
     })
