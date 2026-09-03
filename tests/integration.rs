@@ -43,10 +43,100 @@ async fn mock_chat(axum::Json(body): axum::Json<serde_json::Value>) -> axum::res
         .unwrap()
 }
 
+/// Never answers. Stands in for a backend that accepted the request and then
+/// went quiet — llama-swap with a model that failed to start.
+async fn mock_hang() -> axum::response::Response {
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    axum::response::Response::new(axum::body::Body::empty())
+}
+
+/// 502 with a plain-text body the first time, 200 after that: a model swapper
+/// reporting a swap in progress and then succeeding.
+async fn mock_flaky(
+    axum::extract::State(hits): axum::extract::State<
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    >,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if n == 0 {
+        return (
+            axum::http::StatusCode::BAD_GATEWAY,
+            "unable to start process: process was already starting but wound up in state stopped",
+        )
+            .into_response();
+    }
+    axum::Json(serde_json::json!({
+        "choices":[{"message":{"content":"second try"}}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1}
+    }))
+    .into_response()
+}
+
 async fn spawn_mock_upstream() -> SocketAddr {
     use axum::{routing::get, routing::post, Json, Router};
+    let flaky_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let app = Router::new()
         .route("/chat/completions", post(mock_chat))
+        .route("/hang", post(mock_hang))
+        // One chunk, then silence: a stream that stalls mid-flight.
+        .route(
+            "/stall",
+            post(|| async {
+                use futures_util::StreamExt;
+                let stream = futures_util::stream::iter(vec![
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string(),
+                ])
+                .chain(futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    String::new()
+                }))
+                .map(Ok::<_, std::convert::Infallible>);
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/flaky",
+            post(mock_flaky).with_state(flaky_hits),
+        )
+        .route(
+            "/broken",
+            post(|| async {
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    "unable to start process: process was already starting but wound up in state stopped",
+                )
+            }),
+        )
+        // Echoes the body back so a test can see what inginx forwarded.
+        .route(
+            "/audio/speech-echo",
+            post(|axum::Json(b): axum::Json<serde_json::Value>| async move { Json(b) }),
+        )
+        .route(
+            "/audio/transcriptions",
+            post(|| async { Json(serde_json::json!({"text":"hello"})) }),
+        )
+        // Reports the headers it received, so a test can assert what survived
+        // the hop.
+        .route(
+            "/echo-headers",
+            post(|headers: axum::http::HeaderMap| async move {
+                let m: serde_json::Map<String, serde_json::Value> = headers
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_string(),
+                            serde_json::Value::String(v.to_str().unwrap_or("").to_string()),
+                        )
+                    })
+                    .collect();
+                Json(serde_json::Value::Object(m))
+            }),
+        )
         .route(
             "/models",
             get(|| async { Json(serde_json::json!({"data":[{"id":"m-upstream"}]})) }),
@@ -76,6 +166,11 @@ struct Ctx {
 /// Backend pointed at the mock upstream, model alias "m" -> "m-upstream",
 /// one all-models API key.
 async fn setup() -> Ctx {
+    setup_with(|_| {}).await
+}
+
+/// `setup`, with a chance to change the proxy's knobs before it is served.
+async fn setup_with(tweak: impl FnOnce(&mut proxy::AppState)) -> Ctx {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("t.db")).unwrap();
     std::mem::forget(dir);
@@ -87,11 +182,12 @@ async fn setup() -> Ctx {
         .await
         .unwrap();
     let key = keys::create(&db, "test", true, &[], None).await.unwrap();
-    let state = proxy::AppState::for_test(
+    let mut state = proxy::AppState::for_test(
         db.clone(),
         logstore::spawn_writer(db.clone()),
         reqwest::Client::new(),
     );
+    tweak(&mut state);
     let inginx = spawn_app(proxy::router(state)).await;
     Ctx { db, inginx, key }
 }
@@ -429,4 +525,256 @@ async fn models_filtered_per_key() {
         .await
         .unwrap();
     assert_eq!(v["data"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn hung_backend_times_out_and_is_logged() {
+    // The failure this was written for: the backend takes the request and
+    // never answers. Before the timeout the request hung until the client
+    // gave up and — because the log row is written after the response — left
+    // no trace at all.
+    let ctx = setup_with(|st| {
+        st.upstream_timeout = Some(std::time::Duration::from_millis(300));
+        st.upstream_retry_on_5xx = false;
+    })
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/hang", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 504);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "upstream_timeout");
+
+    wait_for_rows(&ctx.db, 1).await;
+    let (status, error): (i64, String) = ctx
+        .db
+        .call(|c| {
+            Ok(c.query_row("SELECT status, error FROM requests", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(status, 504);
+    assert!(error.contains("did not respond"), "{error}");
+}
+
+#[tokio::test]
+async fn swap_in_progress_502_is_retried_once() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/flaky", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "second try");
+}
+
+#[tokio::test]
+async fn plain_text_upstream_error_is_reshaped_for_the_client() {
+    let ctx = setup_with(|st| st.upstream_retry_on_5xx = false).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/broken", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "upstream_error");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("wound up in state stopped"));
+
+    // The log keeps the upstream's own body, not the reshaped one.
+    wait_for_rows(&ctx.db, 1).await;
+    let raw: Vec<u8> = ctx
+        .db
+        .call(|c| Ok(c.query_row("SELECT resp_body FROM requests", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert!(!raw.is_empty());
+}
+
+#[tokio::test]
+async fn voice_map_rewrites_the_forwarded_request() {
+    let ctx = setup().await;
+    registry::set_model_voice_map(&ctx.db, 1, Some(r#"{"alloy":"af_alloy"}"#.to_string()))
+        .await
+        .unwrap();
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/audio/speech-echo", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m","input":"hi","voice":"alloy"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let echoed: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(echoed["voice"], "af_alloy");
+    // The model name is still rewritten to the upstream one.
+    assert_eq!(echoed["model"], "m-upstream");
+}
+
+#[tokio::test]
+async fn audio_upload_is_not_token_counted() {
+    let ctx = setup().await;
+    let form = reqwest::multipart::Form::new().text("model", "m").part(
+        "file",
+        reqwest::multipart::Part::bytes(vec![0u8, 159, 146, 150, 7, 7, 7])
+            .file_name("a.wav")
+            .mime_str("audio/wav")
+            .unwrap(),
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/audio/transcriptions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    wait_for_rows(&ctx.db, 1).await;
+    let (pt, src): (i64, String) = ctx
+        .db
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT prompt_tokens, usage_source FROM requests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(pt, 0, "a blob of audio has no prompt tokens to estimate");
+    assert_eq!(src, "none");
+}
+
+#[tokio::test]
+async fn rejected_requests_are_logged_and_then_throttled() {
+    let ctx = setup_with(|st| {
+        st.api_throttle = std::sync::Arc::new(inginx::ratelimit::LoginThrottle::new(
+            2,
+            std::time::Duration::from_secs(60),
+        ));
+    })
+    .await;
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", ctx.inginx))
+            .bearer_auth("igx_wrong")
+            .json(&serde_json::json!({"model":"m"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+    // The wall goes up on the third try.
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", ctx.inginx))
+        .bearer_auth("igx_wrong")
+        .json(&serde_json::json!({"model":"m"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+
+    wait_for_rows(&ctx.db, 2).await;
+    let (id, status, key_id): (String, i64, Option<i64>) = ctx
+        .db
+        .call(|c| {
+            Ok(
+                c.query_row("SELECT id, status, key_id FROM requests LIMIT 1", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(status, 401);
+    assert!(key_id.is_none());
+    // The layer runs before the body is read, and that stays true: an
+    // unauthenticated caller still cannot make us buffer a body.
+    let (req_body, _) = logstore::get_bodies(&ctx.db, &id).await.unwrap().unwrap();
+    assert!(req_body.is_empty());
+}
+
+#[tokio::test]
+async fn models_list_carries_created() {
+    let ctx = setup().await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{}/v1/models", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["data"][0]["id"], "m");
+    assert!(
+        v["data"][0]["created"].as_i64().unwrap() > 1_600_000_000,
+        "created must be a real timestamp: {}",
+        v["data"][0]
+    );
+}
+
+#[tokio::test]
+async fn client_headers_reach_the_backend() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/echo-headers", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .header("x-title", "my-app")
+        .header("user-agent", "probe/1.0")
+        .json(&serde_json::json!({"model":"m"}))
+        .send()
+        .await
+        .unwrap();
+    let seen: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(seen["x-title"], "my-app");
+    assert_eq!(seen["user-agent"], "probe/1.0");
+    // The client's inginx key is never handed to the backend.
+    assert!(seen.get("authorization").is_none(), "{seen}");
+}
+
+#[tokio::test]
+async fn stalled_stream_is_abandoned_and_logged() {
+    let ctx = setup_with(|st| {
+        st.upstream_stream_idle = Some(std::time::Duration::from_millis(300));
+    })
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/stall", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model":"m","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200); // headers already went out
+                                    // The body ends early rather than hanging for the upstream's 60s.
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), resp.text()).await;
+    assert!(body.is_ok(), "stalled stream must not hang the client");
+
+    wait_for_rows(&ctx.db, 1).await;
+    let error: Option<String> = ctx
+        .db
+        .call(|c| Ok(c.query_row("SELECT error FROM requests", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert!(
+        error.unwrap_or_default().contains("stalled"),
+        "the abandoned stream must say why"
+    );
 }

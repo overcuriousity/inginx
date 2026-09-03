@@ -406,6 +406,8 @@ table.grid td:last-child:has(button), table.grid td:last-child:has(form) { width
 /* The inline alias editor is one field in a table cell, not a page-width form;
    it takes the width of a model name and stops. */
 .alias-input { max-width: 220px; }
+/* The voice map is a list, not a name — it needs the room. */
+.voice-input { max-width: 260px; font-family: var(--font-mono); font-size: var(--text-xs); }
 
 /* Shown once and never again, so it is drawn as something to copy rather than
    as another line of the page: the dashed accent border is the only one in the

@@ -1,14 +1,15 @@
 use crate::db::{now, Db};
 use crate::logstore::{get_setting, set_setting};
 use crate::proxy::AppState;
+use crate::ratelimit::{client_ip, PeerAddr};
 use anyhow::Result;
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::Argon2;
 use axum::{
-    extract::{ConnectInfo, FromRequestParts, Query, State},
-    http::{header, request::Parts, HeaderMap, StatusCode},
+    extract::{Query, State},
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -17,27 +18,6 @@ use axum::{
 use maud::{html, Markup, DOCTYPE};
 use rand::RngCore;
 use serde::Deserialize;
-use std::convert::Infallible;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-/// The peer address, or `None` when the server was not told one — which is the
-/// case in unit tests that drive the router directly. A never-rejecting
-/// extractor, so a missing connect-info degrades to "unknown address" rather
-/// than a 500; `Option<ConnectInfo<_>>` is not itself an extractor in axum
-/// 0.8, which is why this wrapper exists.
-struct PeerAddr(Option<SocketAddr>);
-
-impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
-    type Rejection = Infallible;
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(PeerAddr(
-            parts
-                .extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|ci| ci.0),
-        ))
-    }
-}
 
 const SESSION_COOKIE: &str = "inginx_session";
 const SESSION_TTL: i64 = 7 * 24 * 3600;
@@ -143,44 +123,6 @@ fn is_https(headers: &HeaderMap, trust_proxy: bool) -> bool {
             .and_then(|v| v.to_str().ok())
             .map(|v| v.eq_ignore_ascii_case("https"))
             .unwrap_or(false)
-}
-
-/// The address the login lockout is keyed on.
-///
-/// Without a trusted proxy this is the peer the server actually sees, and the
-/// forwarding headers are ignored — they are attacker-set on a direct
-/// connection, and keying the brute-force wall on a spoofable header would let
-/// a guesser rotate one value to walk around it.
-///
-/// With `trust_proxy_headers`, the peer *is* the proxy and the same peer for
-/// everyone, so keying on it would put all clients in one lockout bucket — an
-/// attacker could lock the real admin out, and no two clients could be told
-/// apart. There the proxy is the authority: `X-Real-IP` if it set one, else
-/// the rightmost `X-Forwarded-For` entry, which is the address the nearest
-/// (trusted) proxy observed and appended — a client-supplied prefix cannot
-/// displace it.
-fn client_ip(headers: &HeaderMap, peer: PeerAddr, trust_proxy: bool) -> IpAddr {
-    let fallback = || {
-        peer.0
-            .map(|a| a.ip())
-            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-    };
-    if !trust_proxy {
-        return fallback();
-    }
-    if let Some(ip) = headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<IpAddr>().ok())
-    {
-        return ip;
-    }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.rsplit(',').next())
-        .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        .unwrap_or_else(fallback)
 }
 
 /// Looks up the session for this request. Returns (token, full).
@@ -747,6 +689,7 @@ mod tests {
     use super::*;
     use crate::keys::testdb;
     use crate::logstore::spawn_writer;
+    use std::net::IpAddr;
     use tower::ServiceExt;
 
     async fn state() -> AppState {

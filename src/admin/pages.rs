@@ -407,7 +407,11 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                         }
                     }
                     table class="grid" {
-                        thead { tr { th { "Alias (public)" } th { "Upstream name" } th { "Status" } th {} } }
+                        thead { tr {
+                            th { "Alias (public)" } th { "Upstream name" }
+                            th title="Rewrites the `voice` field of /v1/audio/speech before forwarding" { "Voice map" }
+                            th { "Status" } th {}
+                        } }
                         tbody {
                             @for m in models.iter().filter(|m| m.backend_id == b.id) {
                                 tr {
@@ -419,6 +423,19 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                                         }
                                     }
                                     td class="mono" { (m.upstream_name) }
+                                    // Backends name their voices their own way
+                                    // (Kokoro `af_alloy`, Piper by language),
+                                    // while OpenAI clients send `alloy`. One
+                                    // `from=to` list per model bridges that.
+                                    td {
+                                        form class="inline" hx-post=(format!("/admin/models/{}/voices", m.id))
+                                            hx-target="#backends-area" hx-swap="outerHTML" {
+                                            input type="text" name="voice_map"
+                                                value=(crate::proxy::format_voice_map(m.voice_map.as_deref()))
+                                                class="alias-input voice-input" placeholder="alloy=af_alloy, nova=af_nova"
+                                                title="Comma-separated from=to pairs. Edit and press Enter.";
+                                        }
+                                    }
                                     td {
                                         @if m.enabled { span class="badge badge-success" { "enabled" } }
                                         @else { span class="badge badge-muted" { "disabled" } }

@@ -121,7 +121,8 @@ pub fn estimate_tokens(text: &str) -> u32 {
 }
 
 /// Estimates tokens for an arbitrary body: JSON → tokens of all string leaves;
-/// other UTF-8 → tokens of the text; binary → len/4.
+/// other UTF-8 → tokens of the text; binary → 0, because guessing from the
+/// byte count of an audio upload is worse than admitting we do not know.
 pub fn estimate_body_tokens(body: &[u8]) -> u32 {
     if body.is_empty() {
         return 0;
@@ -131,9 +132,12 @@ pub fn estimate_body_tokens(body: &[u8]) -> u32 {
         collect_strings(&v, &mut text);
         return estimate_tokens(&text);
     }
+    // A body that is not text is not something we can count. The old
+    // `len / 4` guess turned an audio upload into millions of phantom prompt
+    // tokens; the caller records `usage_source = "none"` instead.
     match std::str::from_utf8(body) {
         Ok(s) => estimate_tokens(s),
-        Err(_) => (body.len() / 4).max(1) as u32,
+        Err(_) => 0,
     }
 }
 
@@ -157,7 +161,8 @@ mod tests {
     fn estimates_are_sane() {
         let n = estimate_tokens("The quick brown fox jumps over the lazy dog.");
         assert!((8..=14).contains(&n), "got {n}");
-        assert!(estimate_body_tokens(&[0u8, 159, 146, 150]) >= 1); // binary fallback
+        // Binary is not counted at all — see the note on estimate_body_tokens.
+        assert_eq!(estimate_body_tokens(&[0u8, 159, 146, 150]), 0);
         let j = estimate_body_tokens(br#"{"messages":[{"role":"user","content":"hello world"}]}"#);
         assert!(j >= 2, "got {j}");
     }

@@ -19,6 +19,15 @@ pub struct Model {
     pub upstream_name: String,
     pub alias: String,
     pub enabled: bool,
+    /// Optional JSON object rewriting the `voice` field of an audio request
+    /// before it is forwarded — `{"alloy": "af_alloy"}`. Backends name their
+    /// voices whatever they like (Kokoro's `af_*`, Piper's language codes),
+    /// while every stock OpenAI client sends `alloy`; this is where the two
+    /// are reconciled. See `proxy::apply_voice_map`.
+    pub voice_map: Option<String>,
+    /// Unix seconds. Reported as `created` on `/v1/models`, which some clients
+    /// require to be present. Rows written before this column existed carry 0.
+    pub created_at: i64,
 }
 
 fn backend_from_row(r: &rusqlite::Row) -> rusqlite::Result<Backend> {
@@ -41,10 +50,12 @@ fn model_from_row(r: &rusqlite::Row) -> rusqlite::Result<Model> {
         upstream_name: r.get(2)?,
         alias: r.get(3)?,
         enabled: r.get::<_, i64>(4)? != 0,
+        voice_map: r.get(5)?,
+        created_at: r.get(6)?,
     })
 }
 
-const MODEL_COLS: &str = "id, backend_id, upstream_name, alias, enabled";
+const MODEL_COLS: &str = "id, backend_id, upstream_name, alias, enabled, voice_map, created_at";
 
 pub async fn add_backend(
     db: &Db,
@@ -92,8 +103,9 @@ pub async fn add_model(db: &Db, backend_id: i64, upstream_name: &str, alias: &st
     let alias = alias.to_string();
     db.call(move |c| {
         c.execute(
-            "INSERT INTO models (backend_id, upstream_name, alias) VALUES (?1, ?2, ?3)",
-            rusqlite::params![backend_id, upstream_name, alias],
+            "INSERT INTO models (backend_id, upstream_name, alias, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![backend_id, upstream_name, alias, crate::db::now()],
         )?;
         Ok(c.last_insert_rowid())
     })
@@ -105,6 +117,7 @@ pub async fn resolve(db: &Db, alias: &str) -> Result<Option<(Model, Backend)>> {
     db.call(move |c| {
         let mut stmt = c.prepare(
             "SELECT m.id, m.backend_id, m.upstream_name, m.alias, m.enabled,
+                    m.voice_map, m.created_at,
                     b.id, b.name, b.base_url, b.upstream_api_key, b.enabled, b.is_default
              FROM models m JOIN backends b ON b.id = m.backend_id
              WHERE m.alias = ?1 AND m.enabled = 1 AND b.enabled = 1",
@@ -118,14 +131,16 @@ pub async fn resolve(db: &Db, alias: &str) -> Result<Option<(Model, Backend)>> {
                         upstream_name: r.get(2)?,
                         alias: r.get(3)?,
                         enabled: r.get::<_, i64>(4)? != 0,
+                        voice_map: r.get(5)?,
+                        created_at: r.get(6)?,
                     },
                     Backend {
-                        id: r.get(5)?,
-                        name: r.get(6)?,
-                        base_url: r.get(7)?,
-                        upstream_api_key: r.get(8)?,
-                        enabled: r.get::<_, i64>(9)? != 0,
-                        is_default: r.get::<_, i64>(10)? != 0,
+                        id: r.get(7)?,
+                        name: r.get(8)?,
+                        base_url: r.get(9)?,
+                        upstream_api_key: r.get(10)?,
+                        enabled: r.get::<_, i64>(11)? != 0,
+                        is_default: r.get::<_, i64>(12)? != 0,
                     },
                 ))
             })
@@ -183,7 +198,8 @@ pub async fn models_for_key(db: &Db, key: &ApiKey) -> Result<Vec<Model>> {
                  ORDER BY alias"
             )
         } else {
-            "SELECT m.id, m.backend_id, m.upstream_name, m.alias, m.enabled FROM models m
+            "SELECT m.id, m.backend_id, m.upstream_name, m.alias, m.enabled,
+                    m.voice_map, m.created_at FROM models m
              JOIN key_models km ON km.model_id = m.id AND km.key_id = ?1
              JOIN backends b ON b.id = m.backend_id AND b.enabled = 1
              WHERE m.enabled = 1 ORDER BY m.alias"
@@ -219,6 +235,20 @@ pub async fn set_model_alias(db: &Db, model_id: i64, alias: &str) -> Result<()> 
         c.execute(
             "UPDATE models SET alias = ?1 WHERE id = ?2",
             rusqlite::params![alias, model_id],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// Stores (or clears, with `None`) the voice rewrite map for one model. The
+/// caller is responsible for handing over a JSON object; `parse_voice_map`
+/// turns the admin form's `alloy=af_alloy, nova=af_nova` into one.
+pub async fn set_model_voice_map(db: &Db, model_id: i64, map: Option<String>) -> Result<()> {
+    db.call(move |c| {
+        c.execute(
+            "UPDATE models SET voice_map = ?1 WHERE id = ?2",
+            rusqlite::params![map, model_id],
         )?;
         Ok(())
     })
@@ -269,8 +299,9 @@ pub async fn import_models(db: &Db, backend_id: i64) -> Result<Vec<String>> {
         let mut added = Vec::new();
         for id in ids {
             let n = tx.execute(
-                "INSERT OR IGNORE INTO models (backend_id, upstream_name, alias) VALUES (?1, ?2, ?3)",
-                rusqlite::params![backend_id, id, id],
+                "INSERT OR IGNORE INTO models (backend_id, upstream_name, alias, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![backend_id, id, id, crate::db::now()],
             )?;
             if n > 0 {
                 added.push(id);

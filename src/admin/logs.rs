@@ -213,6 +213,10 @@ pub async fn logs_page(State(st): State<AppState>, Query(q): Query<LogQuery>) ->
                             td { (r.prompt_tokens) " / " (r.completion_tokens) }
                             td {
                                 @if r.usage_source == "upstream" { span class="badge badge-success" { "exact" } }
+                                // "none" is not a worse estimate, it is the
+                                // absence of one: an audio upload or a
+                                // rejected request has no tokens to count.
+                                @else if r.usage_source == "none" { span class="badge badge-muted" { "n/a" } }
                                 @else { span class="badge badge-warning" { "est." } }
                             }
                         }

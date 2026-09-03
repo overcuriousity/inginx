@@ -21,10 +21,71 @@
 //! trust `X-Forwarded-For` for the key: it is attacker-set, and keying on it
 //! would let a guesser rotate one header to dodge the wall entirely.
 
+use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::http::{request::Parts, HeaderMap};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// The peer address, or `None` when the server was not told one — which is the
+/// case in unit tests that drive the router directly. A never-rejecting
+/// extractor, so a missing connect-info degrades to "unknown address" rather
+/// than a 500; `Option<ConnectInfo<_>>` is not itself an extractor in axum
+/// 0.8, which is why this wrapper exists.
+pub struct PeerAddr(pub Option<SocketAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
+    type Rejection = Infallible;
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(PeerAddr(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0),
+        ))
+    }
+}
+
+/// The address a lockout is keyed on — the admin login's and the `/v1`
+/// API-key wall's alike.
+///
+/// Without a trusted proxy this is the peer the server actually sees, and the
+/// forwarding headers are ignored — they are attacker-set on a direct
+/// connection, and keying the brute-force wall on a spoofable header would let
+/// a guesser rotate one value to walk around it.
+///
+/// With `trust_proxy_headers`, the peer *is* the proxy and the same peer for
+/// everyone, so keying on it would put all clients in one lockout bucket — an
+/// attacker could lock the real admin out, and no two clients could be told
+/// apart. There the proxy is the authority: `X-Real-IP` if it set one, else
+/// the rightmost `X-Forwarded-For` entry, which is the address the nearest
+/// (trusted) proxy observed and appended — a client-supplied prefix cannot
+/// displace it.
+pub fn client_ip(headers: &HeaderMap, peer: PeerAddr, trust_proxy: bool) -> IpAddr {
+    let fallback = || {
+        peer.0
+            .map(|a| a.ip())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+    };
+    if !trust_proxy {
+        return fallback();
+    }
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+    {
+        return ip;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.rsplit(',').next())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+        .unwrap_or_else(fallback)
+}
 
 /// Ceiling on the doubling lockout. Long enough to make sustained guessing
 /// pointless, short enough that a locked-out real admin is not locked out for

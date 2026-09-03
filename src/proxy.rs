@@ -1,7 +1,7 @@
 use crate::db::{now, Db};
 use crate::keys::ApiKey;
 use crate::logstore::{LogRecord, LogWriter};
-use crate::ratelimit::LoginThrottle;
+use crate::ratelimit::{client_ip, LoginThrottle, PeerAddr};
 use crate::{keys, metering, registry};
 use axum::{
     body::Bytes,
@@ -12,6 +12,7 @@ use axum::{
     routing::{any, get},
     Json, Router,
 };
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,6 +29,19 @@ pub struct AppState {
     /// Whether to believe `X-Real-IP` / `X-Forwarded-For` / `X-Forwarded-Proto`
     /// from a fronting reverse proxy. See `config::Config::trust_proxy_headers`.
     pub trust_proxy_headers: bool,
+    /// Ceiling on the wait for upstream response headers. `None` disables it.
+    /// Without one, a backend that accepts the connection and then goes quiet
+    /// holds the request open forever and — because the log record is written
+    /// only once the response is in hand — leaves nothing in the log.
+    pub upstream_timeout: Option<std::time::Duration>,
+    /// Ceiling on the gap between two bytes of a streaming response.
+    pub upstream_stream_idle: Option<std::time::Duration>,
+    /// Retry once when a non-streaming request comes back 502/503. A model
+    /// swapper answers that way while it is starting a model.
+    pub upstream_retry_on_5xx: bool,
+    /// Brute-force wall for `/v1` API-key authentication, keyed on the client
+    /// address exactly as the admin login's is.
+    pub api_throttle: Arc<LoginThrottle>,
 }
 
 impl AppState {
@@ -43,6 +57,10 @@ impl AppState {
             login_throttle: Arc::new(LoginThrottle::new(5, std::time::Duration::from_secs(300))),
             max_body_bytes: 32 * 1024 * 1024,
             trust_proxy_headers: false,
+            upstream_timeout: Some(std::time::Duration::from_secs(300)),
+            upstream_stream_idle: Some(std::time::Duration::from_secs(120)),
+            upstream_retry_on_5xx: true,
+            api_throttle: Arc::new(LoginThrottle::new(20, std::time::Duration::from_secs(300))),
         }
     }
 }
@@ -68,7 +86,33 @@ pub fn router(state: AppState) -> Router {
 /// the body. See the note in `router` for why this is a layer and not a step
 /// inside `proxy_handler`.
 async fn require_api_key(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
+    let ip = client_ip(
+        req.headers(),
+        PeerAddr(
+            req.extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0),
+        ),
+        st.trust_proxy_headers,
+    );
+    // A locked-out address is turned away before the hash comparison and
+    // before anything is written to the log, so a guesser can neither spend
+    // our CPU nor flood the request log by hammering the endpoint.
+    if let Some(left) = st.api_throttle.check(ip) {
+        return openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!(
+                "Too many failed authentication attempts. Try again in {}s.",
+                left.as_secs().max(1)
+            ),
+            "rate_limit_exceeded",
+        );
+    }
+    let endpoint = req.uri().path().to_string();
+    let req_headers = headers_json(req.headers());
     let Some(token) = bearer(req.headers()) else {
+        st.api_throttle.on_failure(ip);
+        log_auth_failure(&st, endpoint, req_headers, "missing API key");
         return openai_error(
             StatusCode::UNAUTHORIZED,
             "Missing API key",
@@ -77,14 +121,19 @@ async fn require_api_key(State(st): State<AppState>, mut req: Request, next: Nex
     };
     match keys::authenticate(&st.db, token).await {
         Ok(Some(key)) => {
+            st.api_throttle.on_success(ip);
             req.extensions_mut().insert(key);
             next.run(req).await
         }
-        Ok(None) => openai_error(
-            StatusCode::UNAUTHORIZED,
-            "Invalid API key",
-            "invalid_api_key",
-        ),
+        Ok(None) => {
+            st.api_throttle.on_failure(ip);
+            log_auth_failure(&st, endpoint, req_headers, "invalid API key");
+            openai_error(
+                StatusCode::UNAUTHORIZED,
+                "Invalid API key",
+                "invalid_api_key",
+            )
+        }
         Err(e) => {
             tracing::error!("auth failure: {e}");
             openai_error(
@@ -94,6 +143,31 @@ async fn require_api_key(State(st): State<AppState>, mut req: Request, next: Nex
             )
         }
     }
+}
+
+/// Writes the log row for a rejected request. Rejections used to return from
+/// the middleware without touching the log at all, which made credential
+/// stuffing against `/v1` invisible in the GUI — the one thing an operator
+/// most wants to see. The body is deliberately absent: the layer runs before
+/// it is read, so an unauthenticated caller still cannot make us buffer one.
+fn log_auth_failure(st: &AppState, endpoint: String, req_headers: String, error: &str) {
+    st.log.send(LogRecord {
+        id: ulid::Ulid::new().to_string(),
+        ts: now(),
+        key_id: None,
+        model: None,
+        endpoint,
+        status: 401,
+        latency_ms: 0,
+        ttfb_ms: None,
+        usage: metering::Usage::default(),
+        usage_source: "none",
+        error: Some(error.to_string()),
+        req_headers,
+        resp_headers: "{}".into(),
+        req_body: Vec::new(),
+        resp_body: Vec::new(),
+    });
 }
 
 pub fn openai_error(status: StatusCode, msg: &str, code: &str) -> Response {
@@ -182,8 +256,12 @@ async fn models_handler(State(st): State<AppState>, Extension(key): Extension<Ap
     match registry::models_for_key(&st.db, &key).await {
         Ok(models) => Json(serde_json::json!({
             "object": "list",
+            // `created` is required by stricter clients (some LangChain and
+            // LibreChat builds refuse a model entry without it). Rows written
+            // before the column existed carry 0, which is a valid timestamp.
             "data": models.iter().map(|m| serde_json::json!({
-                "id": m.alias, "object": "model", "owned_by": "inginx"
+                "id": m.alias, "object": "model", "owned_by": "inginx",
+                "created": m.created_at
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
@@ -216,6 +294,183 @@ fn extract_model(body: &[u8], content_type: &str) -> Option<String> {
     v.get("model")?.as_str().map(String::from)
 }
 
+/// Headers that belong to this connection rather than to the request, plus the
+/// two we always set ourselves. `Authorization` is dropped because the client's
+/// inginx key means nothing upstream — the backend's own key, if any, is added
+/// after this loop — and `Accept-Encoding` because a compressed upstream body
+/// would defeat both the usage extraction and the log store.
+fn is_hop_by_hop(name: &str) -> bool {
+    const DENY: [&str; 13] = [
+        "authorization",
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "cookie",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    let n = name.to_ascii_lowercase();
+    DENY.contains(&n.as_str())
+}
+
+/// Rewrites the `voice` field of an audio request through a model's map.
+/// `map` is a JSON object of `client name -> backend name`; anything else
+/// (a malformed map, a body that is not an object, a voice with no entry) is
+/// left alone, so a bad map degrades to today's behaviour rather than breaking
+/// every request.
+pub(crate) fn apply_voice_map(body: &[u8], map: &str) -> Option<Vec<u8>> {
+    let table = serde_json::from_str::<serde_json::Value>(map).ok()?;
+    let table = table.as_object()?;
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let current = v.get("voice")?.as_str()?.to_string();
+    let mapped = table.get(&current)?.as_str()?;
+    if mapped == current {
+        return None;
+    }
+    v.as_object_mut()?.insert(
+        "voice".into(),
+        serde_json::Value::String(mapped.to_string()),
+    );
+    serde_json::to_vec(&v).ok()
+}
+
+/// Parses the admin form's `alloy=af_alloy, nova=af_nova` into the JSON object
+/// stored on the model. An empty input clears the map.
+pub fn parse_voice_map(input: &str) -> Result<Option<String>, String> {
+    let mut map = serde_json::Map::new();
+    for pair in input.split([',', '\n']) {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (from, to) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("expected `from=to`, got `{pair}`"))?;
+        let (from, to) = (from.trim(), to.trim());
+        if from.is_empty() || to.is_empty() {
+            return Err(format!("expected `from=to`, got `{pair}`"));
+        }
+        map.insert(from.to_string(), serde_json::Value::String(to.to_string()));
+    }
+    if map.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::Value::Object(map).to_string()))
+}
+
+/// Renders a stored voice map back into the form's `from=to, from=to` shape.
+pub fn format_voice_map(map: Option<&str>) -> String {
+    let Some(raw) = map else {
+        return String::new();
+    };
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return raw.to_string();
+    };
+    obj.iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}={s}")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Why a request never produced a response. The two cases want different
+/// status codes: a backend we could not reach is a 502, a backend that took
+/// the request and went quiet is a 504 — and telling them apart in the log is
+/// the difference between "the GPU box is down" and "the model would not load".
+pub(crate) enum UpstreamError {
+    Timeout(u64),
+    Transport(String),
+}
+
+impl UpstreamError {
+    fn status(&self) -> StatusCode {
+        match self {
+            UpstreamError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            UpstreamError::Transport(_) => StatusCode::BAD_GATEWAY,
+        }
+    }
+    fn code(&self) -> &'static str {
+        match self {
+            UpstreamError::Timeout(_) => "upstream_timeout",
+            UpstreamError::Transport(_) => "upstream_unreachable",
+        }
+    }
+    fn message(&self) -> String {
+        match self {
+            UpstreamError::Timeout(s) => {
+                format!("Upstream backend did not respond within {s}s")
+            }
+            UpstreamError::Transport(e) => format!("Upstream backend unreachable: {e}"),
+        }
+    }
+}
+
+/// Sends one attempt, bounded by `timeout` if there is one. The timeout covers
+/// the wait for response *headers*; the body has its own.
+async fn send_upstream(
+    req: reqwest::RequestBuilder,
+    timeout: Option<std::time::Duration>,
+) -> Result<reqwest::Response, UpstreamError> {
+    match timeout {
+        Some(d) => tokio::time::timeout(d, req.send())
+            .await
+            .map_err(|_| UpstreamError::Timeout(d.as_secs()))?
+            .map_err(|e| UpstreamError::Transport(e.to_string())),
+        None => req
+            .send()
+            .await
+            .map_err(|e| UpstreamError::Transport(e.to_string())),
+    }
+}
+
+/// True when a request body is text we can meaningfully count tokens in. A
+/// multipart upload (audio, images) is not, and neither is anything that is
+/// not valid UTF-8 — see the `usage_source = "none"` path in `proxy_handler`.
+fn is_countable_body(content_type: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    !ct.starts_with("multipart/")
+        && !ct.starts_with("audio/")
+        && !ct.starts_with("image/")
+        && !ct.starts_with("video/")
+        && !ct.starts_with("application/octet-stream")
+}
+
+/// True when the body already carries an OpenAI-shaped `error` object, in
+/// which case it is passed through untouched.
+fn looks_like_openai_error(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").cloned())
+        .map(|e| e.is_object() || e.is_string())
+        .unwrap_or(false)
+}
+
+/// Wraps a non-OpenAI upstream failure body in the shape every client parses,
+/// keeping the upstream's own words as the message. Long bodies (an HTML error
+/// page, say) are truncated — the full text is in the request log.
+fn normalized_upstream_error(status: reqwest::StatusCode, body: &[u8]) -> Response {
+    const MAX: usize = 2048;
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    let mut msg = if text.is_empty() {
+        format!("Upstream backend returned {status}")
+    } else if text.len() > MAX {
+        format!("{}…", &text[..text.floor_char_boundary(MAX)])
+    } else {
+        text.to_string()
+    };
+    if msg.len() > MAX + 8 {
+        msg.truncate(MAX);
+    }
+    let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    openai_error(status, &msg, "upstream_error")
+}
+
 pub async fn proxy_handler(
     State(st): State<AppState>,
     Extension(key): Extension<ApiKey>,
@@ -237,12 +492,17 @@ pub async fn proxy_handler(
         .unwrap_or("")
         .to_string();
     let model_alias = extract_model(&body, &content_type);
-    let (upstream_model, backend, model_alias) = match &model_alias {
+    let (upstream_model, voice_map, backend, model_alias) = match &model_alias {
         Some(alias) => {
             match registry::resolve(&st.db, alias).await {
                 Ok(Some((model, backend))) => {
                     match keys::key_allows_model(&st.db, &key, model.id).await {
-                    Ok(true) => (Some(model.upstream_name), backend, Some(alias.clone())),
+                    Ok(true) => (
+                        Some(model.upstream_name),
+                        model.voice_map,
+                        backend,
+                        Some(alias.clone()),
+                    ),
                     Ok(false) => {
                         return openai_error(
                             StatusCode::NOT_FOUND,
@@ -276,7 +536,7 @@ pub async fn proxy_handler(
             }
         }
         None => match registry::default_backend(&st.db).await {
-            Ok(Some(b)) => (None, b, None),
+            Ok(Some(b)) => (None, None, b, None),
             Ok(None) => {
                 return openai_error(
                     StatusCode::BAD_GATEWAY,
@@ -296,11 +556,21 @@ pub async fn proxy_handler(
     };
 
     // 3. Prepare and forward
-    let (upstream_body, usage_injected) = if content_type.starts_with("application/json") {
+    let (mut upstream_body, usage_injected) = if content_type.starts_with("application/json") {
         metering::prepare_upstream_body(&body, upstream_model.as_deref())
     } else {
         (body.to_vec(), false)
     };
+    // Voice names are backend vocabulary, not protocol: Kokoro answers to
+    // `af_alloy`, Piper to a language code, while every stock OpenAI client
+    // asks for `alloy` and gets a 400. The per-model map is the translation.
+    if let Some(map) = voice_map.as_deref() {
+        if content_type.starts_with("application/json") {
+            if let Some(rewritten) = apply_voice_map(&upstream_body, map) {
+                upstream_body = rewritten;
+            }
+        }
+    }
 
     // base_url is the OpenAI-compatible base including `/v1`; forward the
     // request path with its `/v1` prefix stripped.
@@ -315,10 +585,15 @@ pub async fn proxy_handler(
         .http
         .request(method.clone(), &url)
         .body(upstream_body.clone());
-    for h in [header::CONTENT_TYPE, header::ACCEPT] {
-        if let Some(v) = headers.get(&h) {
-            req = req.header(h, v);
+    // Forward the client's headers except the ones that belong to this hop or
+    // that we set ourselves. Only `Content-Type` and `Accept` used to survive,
+    // which silently dropped `User-Agent`, `OpenAI-Beta`, `X-Title` and the
+    // rest — headers some backends route or meter on.
+    for (name, value) in headers.iter() {
+        if is_hop_by_hop(name.as_str()) {
+            continue;
         }
+        req = req.header(name, value);
     }
     if let Some(k) = &backend.upstream_api_key {
         req = req.bearer_auth(k);
@@ -334,15 +609,36 @@ pub async fn proxy_handler(
         started,
     };
 
-    let upstream_resp = match req.send().await {
+    // Keep a second copy of the request for the swap-in-progress retry below.
+    // `try_clone` returns None for a streaming body; ours is always in memory.
+    let retry = st.upstream_retry_on_5xx.then(|| req.try_clone()).flatten();
+
+    let mut upstream_resp = match send_upstream(req, st.upstream_timeout).await {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("Upstream backend unreachable: {e}");
-            let resp = openai_error(StatusCode::BAD_GATEWAY, &msg, "upstream_unreachable");
-            log_failure(&st, log_base, 502, msg);
+            let resp = openai_error(e.status(), &e.message(), e.code());
+            let status = e.status().as_u16();
+            log_failure(&st, log_base, status, e.message());
             return resp;
         }
     };
+
+    // A model swapper answers 502/503 while it brings a model up. The first
+    // request paid for the swap; the second usually lands on a running model.
+    // Only safe here because nothing has reached the client yet.
+    if let Some(retry_req) = retry {
+        if matches!(upstream_resp.status().as_u16(), 502 | 503) {
+            tracing::info!(
+                status = upstream_resp.status().as_u16(),
+                endpoint = %log_base.endpoint,
+                "upstream refused, retrying once"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if let Ok(second) = send_upstream(retry_req, st.upstream_timeout).await {
+                upstream_resp = second;
+            }
+        }
+    }
 
     let status = upstream_resp.status();
     let resp_headers = resp_headers_json(upstream_resp.headers());
@@ -367,25 +663,42 @@ pub async fn proxy_handler(
 
     // 4. Buffered response
     let ttfb_ms = started.elapsed().as_millis() as u32;
-    let resp_body = match upstream_resp.bytes().await {
+    let read_body = async {
+        match st.upstream_timeout {
+            Some(d) => tokio::time::timeout(d, upstream_resp.bytes())
+                .await
+                .map_err(|_| UpstreamError::Timeout(d.as_secs()))?
+                .map_err(|e| UpstreamError::Transport(e.to_string())),
+            None => upstream_resp
+                .bytes()
+                .await
+                .map_err(|e| UpstreamError::Transport(e.to_string())),
+        }
+    };
+    let resp_body = match read_body.await {
         Ok(b) => b,
         Err(e) => {
-            let msg = format!("Failed reading upstream response: {e}");
-            let resp = openai_error(StatusCode::BAD_GATEWAY, &msg, "upstream_unreachable");
-            log_failure(&st, log_base, 502, msg);
+            let resp = openai_error(e.status(), &e.message(), e.code());
+            let code = e.status().as_u16();
+            log_failure(&st, log_base, code, e.message());
             return resp;
         }
     };
 
     let (usage, usage_source) = match metering::extract_usage_json(&resp_body) {
         Some(u) => (u, "upstream"),
-        None => (
+        // Estimating from the request body only means anything when that body
+        // is text. A transcription upload is a blob of audio; running it
+        // through the estimator booked a 50 MB file as twelve million prompt
+        // tokens. Nothing is a better number than a made-up one.
+        None if is_countable_body(&content_type) => (
             metering::Usage {
                 prompt_tokens: metering::estimate_body_tokens(&log_base.req_body),
                 completion_tokens: 0,
             },
             "estimated",
         ),
+        None => (metering::Usage::default(), "none"),
     };
 
     st.log.send(LogRecord {
@@ -406,12 +719,23 @@ pub async fn proxy_handler(
         resp_body: resp_body.to_vec(),
     });
 
+    // An upstream failure is passed through with its status, but clients parse
+    // `{"error": {...}}` and nothing else: llama-swap's plain-text 502 reached
+    // callers as an unhandled exception rather than a message. Reshape it,
+    // keeping the original text as the message — and note that the log above
+    // already holds the untouched body.
+    let client_body = if status.is_success() || looks_like_openai_error(&resp_body) {
+        resp_body
+    } else {
+        return normalized_upstream_error(status, &resp_body);
+    };
+
     let mut builder = Response::builder().status(status.as_u16());
     if !resp_content_type.is_empty() {
         builder = builder.header(header::CONTENT_TYPE, &resp_content_type);
     }
     builder
-        .body(axum::body::Body::from(resp_body))
+        .body(axum::body::Body::from(client_body))
         .unwrap_or_else(|_| {
             openai_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -465,8 +789,11 @@ fn stream_response(
     usage_injected: bool,
 ) -> Response {
     use futures_util::StreamExt;
+    let idle = st.upstream_stream_idle;
     let tee = StreamTee {
         inner: upstream.bytes_stream().boxed(),
+        idle,
+        idle_timer: idle.map(|d| Box::pin(tokio::time::sleep(d))),
         st,
         base: Some(base),
         status: status.as_u16(),
@@ -492,6 +819,11 @@ fn stream_response(
 
 struct StreamTee {
     inner: futures_util::stream::BoxStream<'static, reqwest::Result<Bytes>>,
+    /// How long the stream may go silent before it is abandoned. A stalled
+    /// upstream otherwise holds the connection — and the log record, which is
+    /// written when the stream ends — open indefinitely.
+    idle: Option<std::time::Duration>,
+    idle_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     st: AppState,
     base: Option<LogBase>,
     status: u16,
@@ -541,6 +873,8 @@ fn is_usage_only_event(event: &[u8]) -> bool {
 }
 
 impl futures_util::Stream for StreamTee {
+    // `poll` on the idle timer needs `Future` in scope.
+
     type Item = std::io::Result<Bytes>;
 
     fn poll_next(
@@ -551,7 +885,20 @@ impl futures_util::Stream for StreamTee {
         let this = self.get_mut();
         loop {
             match this.inner.as_mut().poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    let (Some(timer), Some(idle)) = (this.idle_timer.as_mut(), this.idle) else {
+                        return Poll::Pending;
+                    };
+                    match timer.as_mut().poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(()) => {
+                            this.completed = true;
+                            let msg = format!("upstream stream stalled for {}s", idle.as_secs());
+                            this.finish_with_error(msg.clone());
+                            return Poll::Ready(Some(Err(std::io::Error::other(msg))));
+                        }
+                    }
+                }
                 Poll::Ready(None) => {
                     this.completed = true;
                     if this.pending.is_empty() {
@@ -569,6 +916,10 @@ impl futures_util::Stream for StreamTee {
                     return Poll::Ready(Some(Err(std::io::Error::other(e))));
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
+                    // A byte arrived: the stream is alive, so the clock restarts.
+                    if let (Some(timer), Some(idle)) = (this.idle_timer.as_mut(), this.idle) {
+                        timer.as_mut().reset(tokio::time::Instant::now() + idle);
+                    }
                     if this.ttfb_ms.is_none() {
                         if let Some(base) = &this.base {
                             this.ttfb_ms = Some(base.started.elapsed().as_millis() as u32);
@@ -655,6 +1006,95 @@ impl Drop for StreamTee {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_map_rewrites_known_voice_only() {
+        let map = r#"{"alloy":"af_alloy","nova":"af_nova"}"#;
+        let out = apply_voice_map(br#"{"model":"tts-1","voice":"alloy"}"#, map).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["voice"], "af_alloy");
+        assert_eq!(v["model"], "tts-1");
+        // A voice with no entry, a body that is not an object, and a broken
+        // map all leave the request exactly as the client sent it.
+        assert!(apply_voice_map(br#"{"voice":"af_heart"}"#, map).is_none());
+        assert!(apply_voice_map(br#"{"input":"hi"}"#, map).is_none());
+        assert!(apply_voice_map(br#"{"voice":"alloy"}"#, "not json").is_none());
+    }
+
+    #[test]
+    fn voice_map_form_round_trip() {
+        let stored = parse_voice_map(" alloy=af_alloy , nova = af_nova ")
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(v["alloy"], "af_alloy");
+        assert_eq!(v["nova"], "af_nova");
+        let rendered = format_voice_map(Some(&stored));
+        assert!(rendered.contains("alloy=af_alloy"), "{rendered}");
+        assert!(parse_voice_map("   ").unwrap().is_none());
+        assert!(parse_voice_map("alloy").is_err());
+        assert!(parse_voice_map("alloy=").is_err());
+    }
+
+    #[test]
+    fn hop_by_hop_headers_are_not_forwarded() {
+        for name in [
+            "authorization",
+            "Accept-Encoding",
+            "connection",
+            "content-length",
+            "host",
+            "cookie",
+        ] {
+            assert!(is_hop_by_hop(name), "{name} should be dropped");
+        }
+        for name in [
+            "content-type",
+            "accept",
+            "user-agent",
+            "openai-beta",
+            "x-title",
+        ] {
+            assert!(!is_hop_by_hop(name), "{name} should be forwarded");
+        }
+    }
+
+    #[test]
+    fn binary_uploads_are_not_token_counted() {
+        assert!(!is_countable_body("multipart/form-data; boundary=x"));
+        assert!(!is_countable_body("audio/mpeg"));
+        assert!(is_countable_body("application/json"));
+        assert!(is_countable_body(""));
+    }
+
+    #[test]
+    fn upstream_error_bodies_are_reshaped() {
+        assert!(looks_like_openai_error(
+            br#"{"error":{"message":"nope","type":"invalid_request_error"}}"#
+        ));
+        assert!(!looks_like_openai_error(
+            b"unable to start process: process was already starting"
+        ));
+        assert!(!looks_like_openai_error(b"{\"detail\":\"nope\"}"));
+    }
+
+    #[tokio::test]
+    async fn plain_text_upstream_failure_reaches_the_client_as_json() {
+        let resp = normalized_upstream_error(
+            reqwest::StatusCode::BAD_GATEWAY,
+            b"unable to start process: process was already starting but wound up in state stopped",
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "upstream_error");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("wound up in state stopped"));
+    }
 
     #[test]
     fn extract_model_from_json() {

@@ -54,6 +54,16 @@ async fn main() -> Result<()> {
         )),
         max_body_bytes: cfg.max_body_bytes,
         trust_proxy_headers: cfg.trust_proxy_headers,
+        // 0 means "no limit" in the config; the proxy speaks `Option`.
+        upstream_timeout: (cfg.upstream_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(cfg.upstream_timeout_secs)),
+        upstream_stream_idle: (cfg.upstream_stream_idle_secs > 0)
+            .then(|| std::time::Duration::from_secs(cfg.upstream_stream_idle_secs)),
+        upstream_retry_on_5xx: cfg.upstream_retry_on_5xx,
+        api_throttle: std::sync::Arc::new(ratelimit::LoginThrottle::new(
+            cfg.api_auth_max_failures,
+            std::time::Duration::from_secs(cfg.api_auth_lockout_secs),
+        )),
     };
 
     if let Some(token) = admin::auth::ensure_setup_token(&db).await? {

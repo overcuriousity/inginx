@@ -27,6 +27,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/models/{id}/toggle", post(actions::toggle_model))
         .route("/admin/models/{id}/alias", post(actions::rename_model))
+        .route("/admin/models/{id}/voices", post(actions::set_model_voices))
         .route("/admin/logs", get(logs::logs_page))
         .route("/admin/logs/{id}", get(logs::log_detail))
         .route("/admin/logs/{id}/download", get(logs::log_download))

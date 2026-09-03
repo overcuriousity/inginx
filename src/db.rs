@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS backends (
   upstream_api_key TEXT, enabled INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS models (
   id INTEGER PRIMARY KEY, backend_id INTEGER NOT NULL REFERENCES backends(id) ON DELETE CASCADE,
-  upstream_name TEXT NOT NULL, alias TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);
+  upstream_name TEXT NOT NULL, alias TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1,
+  voice_map TEXT, created_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS api_keys (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL,
   all_models INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
@@ -50,12 +51,55 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
+/// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` does
+/// nothing to a table that already exists, so a database written by an older
+/// build needs each new column added by hand. Every entry must carry a
+/// constant default — SQLite refuses `ADD COLUMN` otherwise — and adding one
+/// twice is a no-op, so `open` can run the list unconditionally.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("models", "voice_map", "TEXT"),
+    ("models", "created_at", "INTEGER NOT NULL DEFAULT 0"),
+];
+
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    for (table, column, decl) in ADDED_COLUMNS {
+        let present: bool = {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let mut rows = stmt.query([])?;
+            let mut found = false;
+            while let Some(r) = rows.next()? {
+                if r.get::<_, String>(1)? == *column {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+            // `ADD COLUMN` can only default to a constant, so rows that
+            // predate the column carry 0 — which `/v1/models` would report as
+            // a 1970 timestamp. Stamp them with the migration time instead:
+            // when the model was first seen is unknowable, when inginx learned
+            // to record it is not.
+            if (*table, *column) == ("models", "created_at") {
+                conn.execute(
+                    "UPDATE models SET created_at = ?1 WHERE created_at = 0",
+                    [now()],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        add_missing_columns(&conn)?;
         Ok(Db(Arc::new(Mutex::new(conn))))
     }
 

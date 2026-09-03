@@ -196,6 +196,29 @@ pub async fn rename_model(
     }
 }
 
+/// Sets a model's voice map from the `from=to, from=to` form field. An empty
+/// field clears it.
+pub async fn set_model_voices(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    RawForm(body): RawForm,
+) -> Response {
+    let fields = form_fields(&body);
+    let raw = fields
+        .iter()
+        .find(|(k, _)| k == "voice_map")
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_default();
+    let map = match crate::proxy::parse_voice_map(&raw) {
+        Ok(m) => m,
+        Err(e) => return render_backends(&st, Some(format!("Voice map rejected: {e}"))).await,
+    };
+    match registry::set_model_voice_map(&st.db, id, map).await {
+        Ok(()) => render_backends(&st, None).await,
+        Err(e) => render_backends(&st, Some(format!("Voice map update failed: {e}"))).await,
+    }
+}
+
 async fn render_area(st: &AppState, new_key: Option<&str>) -> Response {
     match key_rows(&st.db).await {
         Ok(rows) => Html(keys_area(&rows, new_key).into_string()).into_response(),

@@ -86,6 +86,12 @@ listen = "0.0.0.0:8080"          # public API + admin GUI
 # admin_listen = "127.0.0.1:8081"  # optional: admin GUI on a separate listener
 db_path = "inginx.db"
 log_level = "info"
+
+upstream_timeout_secs = 300      # wait for upstream response headers (0 = none)
+upstream_stream_idle_secs = 120  # max silence inside a streaming response
+upstream_retry_on_5xx = true     # retry once when the backend answers 502/503
+api_auth_max_failures = 20       # failed /v1 keys from one IP before lockout
+api_auth_lockout_secs = 300      # base lockout, doubles while it keeps failing
 ```
 
 Backends, models, keys, and retention are managed in the GUI and stored in
@@ -96,6 +102,31 @@ the database.
 - inginx speaks plain HTTP; terminate TLS at your reverse proxy. Set
   `X-Forwarded-Proto: https` so WebAuthn derives the right origin (or set RP
   ID/origin under *Settings*).
+- A backend that accepts a request and then goes quiet is answered with a
+  `504 upstream_timeout` after `upstream_timeout_secs`, and the attempt is
+  logged. Without that ceiling such a request hangs until the client gives up
+  and never reaches the log at all. `upstream_retry_on_5xx` covers the other
+  half of a model swapper's behaviour: a 502/503 that means "still starting"
+  is retried once, before any byte has reached the client.
+- Upstream failures that are not OpenAI-shaped (llama-swap answers a failed
+  model start with plain text) are wrapped in `{"error": {...}}` on the way
+  out, keeping the backend's own wording as the message. The untouched body
+  stays in the request log.
+- Failed `/v1` authentications are logged and rate-limited per source IP, on
+  the same doubling lockout as the admin login.
+
+### Voice maps
+
+Backends name TTS voices their own way — Kokoro wants `af_alloy`, Piper wants
+a language code — while every stock OpenAI client sends `alloy`. Each model
+carries an optional voice map, edited in *Backends* beside its alias:
+
+```
+alloy=af_alloy, echo=am_echo, fable=bm_fable, onyx=am_onyx, nova=af_nova, shimmer=af_sky
+```
+
+The `voice` field of a JSON request to that model is rewritten before it is
+forwarded. A voice with no entry is passed through untouched.
 
 ## Retention & export
 

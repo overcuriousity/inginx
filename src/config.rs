@@ -36,6 +36,28 @@ pub struct Config {
     /// about the admin GUI sharing a public listener: with a proxy in front,
     /// that is a deliberate arrangement rather than an exposure.
     pub trust_proxy_headers: bool,
+    /// How long to wait for an upstream backend to produce response headers,
+    /// in seconds. A backend that accepts the connection and then never
+    /// answers — llama-swap with a model that failed to start is the case
+    /// this was written for — used to pin the request until the *client* gave
+    /// up, and because the log record is written after the response, the
+    /// request left no trace at all. 0 disables the limit.
+    pub upstream_timeout_secs: u64,
+    /// How long a streaming response may go without a byte before it is
+    /// abandoned, in seconds. The headers arrived, so `upstream_timeout_secs`
+    /// is already satisfied; this covers a stream that stalls mid-flight.
+    /// 0 disables the limit.
+    pub upstream_stream_idle_secs: u64,
+    /// Retry a request once when the backend answers 502/503 without having
+    /// produced any output. Model swappers report a swap-in-progress that way,
+    /// and the second attempt lands after the model is up. Only non-streaming
+    /// responses are retried, and only before any byte reaches the client.
+    pub upstream_retry_on_5xx: bool,
+    /// Failed API-key authentications from one address before it is locked
+    /// out of `/v1`, and how long that lockout lasts. Same doubling wall as
+    /// the admin login, keyed the same way — see `ratelimit`.
+    pub api_auth_max_failures: u32,
+    pub api_auth_lockout_secs: u64,
 }
 
 impl Default for Config {
@@ -49,6 +71,11 @@ impl Default for Config {
             login_max_failures: 5,
             login_lockout_secs: 300,
             trust_proxy_headers: false,
+            upstream_timeout_secs: 300,
+            upstream_stream_idle_secs: 120,
+            upstream_retry_on_5xx: true,
+            api_auth_max_failures: 20,
+            api_auth_lockout_secs: 300,
         }
     }
 }
