@@ -471,6 +471,42 @@ fn normalized_upstream_error(status: reqwest::StatusCode, body: &[u8]) -> Respon
     openai_error(status, &msg, "upstream_error")
 }
 
+/// Replaces the value of one multipart form field, returning the new body, or
+/// `None` when the field is absent or the body does not parse — in which case
+/// the caller forwards what the client sent.
+///
+/// Byte-level on purpose: the body holds an audio file, so it is not UTF-8,
+/// and a part carries no length prefix, which is what makes an in-place
+/// substitution of a different length safe.
+pub(crate) fn replace_multipart_field(body: &[u8], field: &str, value: &str) -> Option<Vec<u8>> {
+    let needle = format!("name=\"{field}\"");
+    let at = find_bytes(body, needle.as_bytes())?;
+    // The part's headers end at the first blank line after the disposition.
+    let rest = &body[at..];
+    let (offset, gap) = match (find_bytes(rest, b"\r\n\r\n"), find_bytes(rest, b"\n\n")) {
+        (Some(crlf), Some(lf)) if crlf <= lf => (crlf, 4),
+        (_, Some(lf)) => (lf, 2),
+        (Some(crlf), None) => (crlf, 4),
+        (None, None) => return None,
+    };
+    let start = at + offset + gap;
+    // The value runs to the delimiter that opens the next part.
+    let end = start
+        + find_bytes(&body[start..], b"\r\n--").or_else(|| find_bytes(&body[start..], b"\n--"))?;
+    let mut out = Vec::with_capacity(body.len() + value.len());
+    out.extend_from_slice(&body[..start]);
+    out.extend_from_slice(value.as_bytes());
+    out.extend_from_slice(&body[end..]);
+    Some(out)
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 pub async fn proxy_handler(
     State(st): State<AppState>,
     Extension(key): Extension<ApiKey>,
@@ -558,6 +594,15 @@ pub async fn proxy_handler(
     // 3. Prepare and forward
     let (mut upstream_body, usage_injected) = if content_type.starts_with("application/json") {
         metering::prepare_upstream_body(&body, upstream_model.as_deref())
+    } else if content_type.starts_with("multipart/") {
+        // A transcription upload carries its model in a form field, not in
+        // JSON. The alias was resolved from it but never rewritten, so the
+        // backend was asked for inginx's public name — llama-swap answered
+        // "could not find suitable handler for gpgpu/whisper".
+        let rewritten = upstream_model
+            .as_deref()
+            .and_then(|up| replace_multipart_field(&body, "model", up));
+        (rewritten.unwrap_or_else(|| body.to_vec()), false)
     } else {
         (body.to_vec(), false)
     };
@@ -1094,6 +1139,31 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("wound up in state stopped"));
+    }
+
+    #[test]
+    fn multipart_model_field_is_rewritten() {
+        // The exact shape a transcription upload has: the model field, then a
+        // binary file part.
+        let b = b"--BOUND\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpgpu/whisper\r\n--BOUND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\x00\xff\r\n--BOUND--\r\n";
+        let out = replace_multipart_field(b, "model", "whisper").unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\r\n\r\nwhisper\r\n--BOUND"), "{text}");
+        assert!(!text.contains("gpgpu/whisper"));
+        // The binary part survives byte for byte.
+        assert!(out.windows(6).any(|w| w == b"RIFF\x00\xff"));
+        // And the rewritten body still parses as the model we just set.
+        assert_eq!(
+            extract_model(&out, "multipart/form-data; boundary=BOUND"),
+            Some("whisper".into())
+        );
+    }
+
+    #[test]
+    fn multipart_without_the_field_is_left_alone() {
+        let b = b"--B\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\ndata\r\n--B--\r\n";
+        assert!(replace_multipart_field(b, "model", "x").is_none());
+        assert!(replace_multipart_field(b"not multipart at all", "model", "x").is_none());
     }
 
     #[test]

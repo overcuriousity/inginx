@@ -116,9 +116,20 @@ async fn spawn_mock_upstream() -> SocketAddr {
             "/audio/speech-echo",
             post(|axum::Json(b): axum::Json<serde_json::Value>| async move { Json(b) }),
         )
+        // Reports the model it was asked for, the way llama-swap would fail
+        // on one it does not know.
         .route(
             "/audio/transcriptions",
-            post(|| async { Json(serde_json::json!({"text":"hello"})) }),
+            post(|body: axum::body::Bytes| async move {
+                let text = String::from_utf8_lossy(&body);
+                let model = text
+                    .split_once("name=\"model\"")
+                    .and_then(|(_, rest)| rest.split_once("\r\n\r\n"))
+                    .and_then(|(_, v)| v.split("\r\n").next())
+                    .unwrap_or("")
+                    .to_string();
+                Json(serde_json::json!({"text": "hello", "model_seen": model}))
+            }),
         )
         // Reports the headers it received, so a test can assert what survived
         // the hop.
@@ -808,4 +819,30 @@ async fn usage_is_attributed_to_the_key_and_model() {
     assert!(key_id > 0);
     assert_eq!(model, "m");
     assert_eq!((reqs, prompt, completion), (2, 6, 4));
+}
+
+#[tokio::test]
+async fn multipart_uploads_reach_the_backend_under_its_own_model_name() {
+    // The alias is rewritten for JSON bodies; a transcription carries its
+    // model in a form field, and that used to go upstream untouched — the
+    // backend was asked for inginx's public alias and refused it.
+    let ctx = setup().await;
+    let form = reqwest::multipart::Form::new().text("model", "m").part(
+        "file",
+        reqwest::multipart::Part::bytes(vec![0u8, 159, 146, 150])
+            .file_name("a.wav")
+            .mime_str("audio/wav")
+            .unwrap(),
+    );
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("http://{}/v1/audio/transcriptions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["model_seen"], "m-upstream");
 }
