@@ -476,10 +476,15 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                             @for m in models.iter().filter(|m| m.backend_id == b.id) {
                                 tr {
                                     td {
-                                        form class="inline" hx-post=(format!("/admin/models/{}/alias", m.id))
+                                        // The form submitted on Enter and had
+                                        // no other affordance, so an edited
+                                        // field looked saved when it was not.
+                                        // The button says what to press.
+                                        form class="cell-form" hx-post=(format!("/admin/models/{}/alias", m.id))
                                             hx-target="#backends-area" hx-swap="outerHTML" {
                                             input type="text" name="alias" value=(m.alias)
-                                                class="alias-input" title="Edit and press Enter to rename";
+                                                class="alias-input" title="The public model name";
+                                            button type="submit" class="ghost btn-sm" { "Save" }
                                         }
                                     }
                                     td class="mono" { (m.upstream_name) }
@@ -488,12 +493,13 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                                     // while OpenAI clients send `alloy`. One
                                     // `from=to` list per model bridges that.
                                     td {
-                                        form class="inline" hx-post=(format!("/admin/models/{}/voices", m.id))
+                                        form class="cell-form" hx-post=(format!("/admin/models/{}/voices", m.id))
                                             hx-target="#backends-area" hx-swap="outerHTML" {
                                             input type="text" name="voice_map"
                                                 value=(crate::proxy::format_voice_map(m.voice_map.as_deref()))
                                                 class="alias-input voice-input" placeholder="alloy=af_alloy, nova=af_nova"
-                                                title="Comma-separated from=to pairs. Edit and press Enter.";
+                                                title="Comma-separated from=to pairs";
+                                            button type="submit" class="ghost btn-sm" { "Save" }
                                         }
                                     }
                                     td {

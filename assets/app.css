@@ -406,6 +406,11 @@ table.grid td:last-child:has(button), table.grid td:last-child:has(form) { width
 /* The inline alias editor is one field in a table cell, not a page-width form;
    it takes the width of a model name and stops. */
 .alias-input { max-width: 220px; }
+/* An editable cell: the field and its Save button on one line. The button
+   used to be absent entirely — the form submitted on Enter and nothing said
+   so, which reads as "my edit did not save". */
+.cell-form { display: flex; align-items: center; gap: 0.375rem; }
+.cell-form > button { margin-top: 0; }
 /* The voice map is a list, not a name — it needs the room. */
 .voice-input { max-width: 260px; font-family: var(--font-mono); font-size: var(--text-xs); }
 
