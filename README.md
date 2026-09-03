@@ -24,7 +24,37 @@ the common single-operator case:
 
 Everything lives in one process, one SQLite file, one optional TOML file.
 
-## Quickstart
+## Install
+
+One line, x86_64 Linux, installs the binary to `/usr/local/bin` and sets up a
+systemd service:
+
+```console
+$ curl -fsSL https://raw.githubusercontent.com/overcuriousity/inginx/main/install.sh | sudo bash
+```
+
+It downloads the latest tagged release (falling back to the rolling `nightly`
+build of `main`), verifies its SHA-256, writes
+`/etc/systemd/system/inginx.service`, and runs `systemctl enable --now inginx`.
+Knobs:
+
+```console
+$ curl -fsSL .../install.sh | sudo INGINX_CHANNEL=nightly bash   # track main
+$ curl -fsSL .../install.sh | sudo INGINX_VERSION=v0.1.0 bash    # pin a tag
+$ curl -fsSL .../install.sh | sudo INGINX_NO_SERVICE=1 bash      # binary only
+$ curl -fsSL .../install.sh | sudo INGINX_PREFIX=/opt/bin bash   # other prefix
+```
+
+Read the script before piping it into a root shell:
+<https://github.com/overcuriousity/inginx/blob/main/install.sh>.
+
+Then follow the setup URL:
+
+```console
+$ journalctl -u inginx | grep setup
+```
+
+## Quickstart (from source)
 
 ```console
 $ cargo build --release
@@ -94,7 +124,8 @@ Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
 
 ## systemd
 
-See `examples/inginx.service`:
+The install script writes the unit for you. To do it by hand, see
+`examples/inginx.service`:
 
 ```console
 $ sudo cp target/release/inginx /usr/local/bin/

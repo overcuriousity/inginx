@@ -1,0 +1,46 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: |
+          cp target/release/inginx inginx-x86_64-linux
+          sha256sum inginx-x86_64-linux > inginx-x86_64-linux.sha256
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inginx-x86_64-linux
+          path: |
+            inginx-x86_64-linux
+            inginx-x86_64-linux.sha256
+      # Rolling "nightly" prerelease so the install script has a stable URL
+      # for main-branch builds: .../releases/download/nightly/inginx-x86_64-linux
+      - name: Publish rolling nightly release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: "Nightly (main)"
+          body: "Automatic build of `main` (${{ github.sha }})."
+          prerelease: true
+          make_latest: false
+          files: |
+            inginx-x86_64-linux
+            inginx-x86_64-linux.sha256
