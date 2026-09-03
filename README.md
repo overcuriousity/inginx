@@ -128,10 +128,30 @@ alloy=af_alloy, echo=am_echo, fable=bm_fable, onyx=am_onyx, nova=af_nova, shimme
 The `voice` field of a JSON request to that model is rewritten before it is
 forwarded. A voice with no entry is passed through untouched.
 
+## Usage statistics
+
+Every request updates an hourly rollup keyed by (key, model, hour), which is
+what the *Dashboard* and each key's own page read:
+
+- **Dashboard** — requests, tokens (prompt/completion split) and errors over
+  the selected range, plus the busiest models and keys. The range selector
+  (24 hours, 7/30/90 days, 1 year, all time) is in the URL — `/admin?range=1y`
+  — and picks the bucket: hourly up to a week, daily to 90 days, weekly beyond.
+- **API Keys** — the table shows all-time requests, prompt, completion and
+  total tokens per key. A row opens that key's page: the same charts narrowed
+  to it, its per-model breakdown, and a link to its requests in the log.
+- `GET /admin/api/stats?range=&key_id=&model=` returns the series behind the
+  charts as JSON (admin session required).
+
+The rollup is a few dozen bytes per key, model and hour, and it is pruned
+separately from the request bodies — *Settings* keeps it forever by default,
+so a year of statistics survives a week of payload retention.
+
 ## Retention & export
 
 *Settings* → retention prunes request logs hourly by max age and/or a total
-database size cap. Export (GUI or `GET /admin/export?format=native|otel&from=&to=&key=&model=`,
+database size cap, with a separate (default: unlimited) age limit for the
+usage rollup. Export (GUI or `GET /admin/export?format=native|otel&from=&to=&key=&model=`,
 admin session required) produces:
 
 - `native` — one JSON object per request with full decompressed payloads.

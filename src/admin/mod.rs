@@ -3,6 +3,7 @@ pub mod auth;
 pub mod dashboard;
 pub mod logs;
 pub mod pages;
+pub mod usage;
 
 use crate::proxy::AppState;
 use axum::routing::{get, post};
@@ -14,6 +15,7 @@ pub fn router(state: AppState) -> Router {
             "/admin/keys",
             get(pages::keys_page).post(actions::create_key),
         )
+        .route("/admin/keys/{id}", get(dashboard::key_stats_page))
         .route("/admin/keys/{id}/revoke", post(actions::revoke_key))
         .route("/admin/keys/{id}/rotate", post(actions::rotate_key))
         .route(
@@ -331,13 +333,21 @@ mod tests {
         }
 
         // stats endpoint: aligned arrays containing the seeded totals
-        let (status, body) = get_page(&app, "/admin/api/stats?days=1", &cookie).await;
+        let (status, body) = get_page(&app, "/admin/api/stats?range=24h", &cookie).await;
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let hours = v["hours"].as_array().unwrap();
+        let buckets = v["buckets"].as_array().unwrap();
         let requests = v["requests"].as_array().unwrap();
-        assert_eq!(hours.len(), requests.len());
+        assert_eq!(buckets.len(), requests.len());
+        assert_eq!(v["bucket_secs"], 3600);
         assert!(requests.iter().any(|r| r.as_i64().unwrap() >= 4));
+
+        // ...and the same series narrowed to one key, which is what the key
+        // page draws.
+        let (status, body) = get_page(&app, "/admin/api/stats?range=7d&key_id=1", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["buckets"].as_array().unwrap().len() > 24);
 
         // retention persists to settings
         let (status, _) = post_form(
@@ -385,7 +395,8 @@ mod tests {
         // dashboard renders
         let (status, body) = get_page(&app, "/admin", &cookie).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("requests (24h)"), "{body}");
+        assert!(body.contains("prompt / completion"), "{body}");
+        assert!(body.contains("range-picker"), "{body}");
     }
 
     #[tokio::test]

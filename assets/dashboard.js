@@ -1,8 +1,13 @@
-// Wired by the dashboard page only. Guarded so a shared bundle would be
-// inert elsewhere; here it is loaded solely on /admin.
+// The usage charts, on the dashboard and on a key's own page.
+//
+// The card carries `data-stats-url`, so the same file draws whatever that URL
+// returns — all traffic, or one key's — and no inline script is needed, which
+// is what lets the Content-Security-Policy stay at `script-src 'self'`.
 (async function () {
-  if (!document.getElementById('chart-req')) return;
-  const s = await (await fetch('/admin/api/stats?days=7')).json();
+  const card = document.querySelector('[data-stats-url]');
+  if (!card || !document.getElementById('chart-req')) return;
+  const s = await (await fetch(card.getAttribute('data-stats-url'))).json();
+
   // The chart is as wide as the region it sits in. Read from the container
   // rather than from the window: the shell is centred and padded, and the two
   // are not the same number at any width.
@@ -19,13 +24,22 @@
     grid: { stroke: tok('--color-border-subtle') },
     ticks: { stroke: tok('--color-border') },
   };
+  // Buckets wider than an hour are days or weeks: a time-of-day label on a
+  // weekly point is noise, so the tick format follows the bucket.
+  const daily = s.bucket_secs >= 86400;
+  const timeAxis = Object.assign({}, axisStyle, {
+    values: daily
+      ? [[3600 * 24 * 365, '{YYYY}', null, null, '{MMM}', null, null, null, 1],
+         [3600 * 24, '{MMM} {D}', '\n{YYYY}', null, null, null, null, null, 1]]
+      : null,
+  });
   function mk(el, series, data) {
     new uPlot({
       width, height: 200,
       cursor: { drag: { setScale: false } },
       series: [{}, ...series],
-      axes: [axisStyle, axisStyle],
-    }, [s.hours, ...data], document.getElementById(el));
+      axes: [timeAxis, axisStyle],
+    }, [s.buckets, ...data], document.getElementById(el));
   }
   // Assigned by index from the fixed categorical order, never recycled.
   mk('chart-req', [

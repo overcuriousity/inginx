@@ -1,5 +1,6 @@
 use super::pages::{backend_up, err500, layout};
-use crate::db::{now, Db};
+use crate::admin::usage;
+use crate::db::Db;
 use crate::logstore::{get_setting, set_setting};
 use crate::proxy::AppState;
 use anyhow::Result;
@@ -9,7 +10,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     Form,
 };
-use maud::html;
+use maud::{html, Markup};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -18,60 +19,27 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct StatsQuery {
-    days: Option<i64>,
+    pub range: Option<String>,
+    pub key_id: Option<i64>,
+    pub model: Option<String>,
 }
 
-#[derive(serde::Serialize)]
-pub struct Stats {
-    hours: Vec<i64>,
-    requests: Vec<i64>,
-    prompt_tokens: Vec<i64>,
-    completion_tokens: Vec<i64>,
-    errors: Vec<i64>,
-}
-
-async fn stats(db: &Db, days: i64) -> Result<Stats> {
-    let since = now() - days * 86_400;
-    let since_hour = since - since % 3600;
-    let rows: Vec<(i64, i64, i64, i64, i64)> = db
-        .call(move |c| {
-            let mut stmt = c.prepare(
-                "SELECT hour, SUM(n_requests), SUM(prompt_tokens), SUM(completion_tokens), SUM(n_errors)
-                 FROM usage_hourly WHERE hour >= ?1 GROUP BY hour ORDER BY hour",
-            )?;
-            let rows = stmt.query_map([since_hour], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-        .await?;
-    let mut s = Stats {
-        hours: Vec::new(),
-        requests: Vec::new(),
-        prompt_tokens: Vec::new(),
-        completion_tokens: Vec::new(),
-        errors: Vec::new(),
-    };
-    let map: std::collections::HashMap<i64, (i64, i64, i64, i64)> = rows
-        .into_iter()
-        .map(|(h, r, p, ct, e)| (h, (r, p, ct, e)))
-        .collect();
-    let mut h = since_hour;
-    let end = now();
-    while h <= end {
-        let (r, p, ct, e) = map.get(&h).copied().unwrap_or_default();
-        s.hours.push(h);
-        s.requests.push(r);
-        s.prompt_tokens.push(p);
-        s.completion_tokens.push(ct);
-        s.errors.push(e);
-        h += 3600;
+impl StatsQuery {
+    pub fn range(&self) -> usage::Range {
+        usage::range(self.range.as_deref())
     }
-    Ok(s)
+    pub fn filter(&self) -> usage::Filter {
+        usage::Filter {
+            key_id: self.key_id,
+            model: self.model.clone().filter(|m| !m.is_empty()),
+        }
+    }
 }
 
+/// The series behind a chart. Same endpoint for the dashboard and for one
+/// key's page — the filter is in the query string.
 pub async fn stats_api(State(st): State<AppState>, Query(q): Query<StatsQuery>) -> Response {
-    match stats(&st.db, q.days.unwrap_or(7).clamp(1, 90)).await {
+    match usage::series(&st.db, q.range(), &q.filter()).await {
         Ok(s) => axum::Json(s).into_response(),
         Err(e) => err500(e),
     }
@@ -81,36 +49,119 @@ pub async fn stats_api(State(st): State<AppState>, Query(q): Query<StatsQuery>) 
 // Dashboard
 // ---------------------------------------------------------------------------
 
-async fn top_rows(db: &Db, group: &'static str, days: i64) -> Result<Vec<(String, i64, i64)>> {
-    let since = now() - days * 86_400;
-    db.call(move |c| {
-        let sql = if group == "model" {
-            "SELECT COALESCE(NULLIF(model, ''), '(none)'), SUM(n_requests), SUM(prompt_tokens + completion_tokens)
-             FROM usage_hourly WHERE hour >= ?1 GROUP BY model ORDER BY 2 DESC LIMIT 10"
-        } else {
-            "SELECT COALESCE(k.name, '(no key)'), SUM(u.n_requests), SUM(u.prompt_tokens + u.completion_tokens)
-             FROM usage_hourly u LEFT JOIN api_keys k ON k.id = u.key_id
-             WHERE u.hour >= ?1 GROUP BY u.key_id ORDER BY 2 DESC LIMIT 10"
-        };
-        let mut stmt = c.prepare(sql)?;
-        let rows = stmt.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    })
-    .await
+/// The range selector, rendered as links so it works without JavaScript and
+/// so a chosen range is a shareable URL.
+pub fn range_picker(base: &str, current: usage::Range) -> Markup {
+    html! {
+        div class="range-picker" {
+            @for r in usage::RANGES {
+                @if r.key == current.key {
+                    span class="range-option current" { (r.label) }
+                } @else {
+                    a class="range-option" href=(format!("{base}?range={}", r.key)) { (r.label) }
+                }
+            }
+        }
+    }
 }
 
-pub async fn dashboard(State(st): State<AppState>) -> Response {
-    let day = match stats(&st.db, 1).await {
-        Ok(s) => s,
+/// The four numbers above the charts.
+fn measures(t: &usage::Totals, extra: Option<Markup>) -> Markup {
+    html! {
+        div class="measures" {
+            div class="measure" {
+                div class="measure-figure" { (usage::fmt_count(t.requests)) }
+                div class="measure-sub" { "requests" }
+            }
+            div class="measure" {
+                div class="measure-figure" { (usage::fmt_count(t.total_tokens())) }
+                div class="measure-sub" { "tokens" }
+            }
+            div class="measure" {
+                div class="measure-figure" {
+                    (usage::fmt_count(t.prompt_tokens)) " / " (usage::fmt_count(t.completion_tokens))
+                }
+                div class="measure-sub" { "prompt / completion" }
+            }
+            div class="measure" {
+                div class="measure-figure" { (usage::fmt_count(t.errors)) }
+                div class="measure-sub" { "errors" }
+            }
+            @if let Some(e) = extra { (e) }
+        }
+    }
+}
+
+/// The two charts, wired to `/admin/api/stats` with this page's filter. The
+/// URL travels in a data attribute because the CSP forbids inline script.
+fn charts(stats_url: &str, bucket_secs: i64) -> Markup {
+    let bucket_label = match bucket_secs {
+        3600 => "hour",
+        86_400 => "day",
+        _ => "week",
+    };
+    html! {
+        div class="card" data-stats-url=(stats_url) {
+            h2 { "Requests per " (bucket_label) }
+            div class="chart-wrap" { div id="chart-req" {} }
+            h2 { "Tokens per " (bucket_label) }
+            div class="chart-wrap" { div id="chart-tok" {} }
+        }
+        link rel="stylesheet" href="/admin/assets/uplot.min.css";
+        script src="/admin/assets/uplot.iife.min.js" {}
+        script src="/admin/assets/dashboard.js" defer {}
+    }
+}
+
+/// A leaderboard table. `link` turns the name into a link to that row's own
+/// statistics page when there is one.
+fn breakdown_table(title: &str, rows: &[usage::Row], link: Option<&str>) -> Markup {
+    html! {
+        div class="card" {
+            h2 { (title) }
+            table class="grid" {
+                thead { tr {
+                    th { "Name" } th { "Requests" } th { "Prompt" }
+                    th { "Completion" } th { "Total" } th { "Errors" }
+                } }
+                tbody {
+                    @if rows.is_empty() {
+                        tr { td colspan="6" class="muted" { "No usage recorded yet." } }
+                    }
+                    @for r in rows {
+                        tr {
+                            td {
+                                @match (link, r.id) {
+                                    (Some(base), Some(id)) => a href=(format!("{base}{id}")) { (r.name) },
+                                    _ => span { (r.name) },
+                                }
+                            }
+                            td { (usage::fmt_count(r.requests)) }
+                            td { (usage::fmt_count(r.prompt_tokens)) }
+                            td { (usage::fmt_count(r.completion_tokens)) }
+                            td { (usage::fmt_count(r.total_tokens())) }
+                            td { (usage::fmt_count(r.errors)) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub async fn dashboard(State(st): State<AppState>, Query(q): Query<StatsQuery>) -> Response {
+    let r = q.range();
+    let filter = usage::Filter::default();
+    let totals = match usage::totals(&st.db, r, &filter).await {
+        Ok(t) => t,
         Err(e) => return err500(e),
     };
-    let (req_24, tok_24, err_24) = (
-        day.requests.iter().sum::<i64>(),
-        day.prompt_tokens.iter().sum::<i64>() + day.completion_tokens.iter().sum::<i64>(),
-        day.errors.iter().sum::<i64>(),
-    );
-    let top_models = top_rows(&st.db, "model", 7).await.unwrap_or_default();
-    let top_keys = top_rows(&st.db, "key", 7).await.unwrap_or_default();
+    let top_models = usage::breakdown(&st.db, r, &filter, usage::By::Model, 10)
+        .await
+        .unwrap_or_default();
+    let top_keys = usage::breakdown(&st.db, r, &filter, usage::By::Key, 10)
+        .await
+        .unwrap_or_default();
     let backends = crate::registry::list_backends(&st.db)
         .await
         .unwrap_or_default();
@@ -118,52 +169,79 @@ pub async fn dashboard(State(st): State<AppState>) -> Response {
     for b in &backends {
         health.push(backend_up(&st.http, b).await);
     }
+    let health_measure = html! {
+        div class="measure" {
+            div class="measure-figure" {
+                @for (b, up) in backends.iter().zip(&health) {
+                    span class=(if *up { "health-dot up" } else { "health-dot down" }) title=(b.name) {}
+                }
+                @if backends.is_empty() { "—" }
+            }
+            div class="measure-sub" { "backends" }
+        }
+    };
     let body = html! {
-        div class="measures" {
-            div class="measure" { div class="measure-figure" { (req_24) } div class="measure-sub" { "requests (24h)" } }
-            div class="measure" { div class="measure-figure" { (tok_24) } div class="measure-sub" { "tokens (24h)" } }
-            div class="measure" { div class="measure-figure" { (err_24) } div class="measure-sub" { "errors (24h)" } }
-            div class="measure" {
-                div class="measure-figure" {
-                    @for (b, up) in backends.iter().zip(&health) {
-                        span class=(if *up { "health-dot up" } else { "health-dot down" }) title=(b.name) {}
-                    }
-                    @if backends.is_empty() { "—" }
-                }
-                div class="measure-sub" { "backends" }
-            }
-        }
-        div class="card" {
-            h2 { "Requests per hour (7d)" }
-            div class="chart-wrap" { div id="chart-req" {} }
-            h2 { "Tokens per hour (7d)" }
-            div class="chart-wrap" { div id="chart-tok" {} }
-        }
+        (range_picker("/admin", r))
+        (measures(&totals, Some(health_measure)))
+        (charts(&format!("/admin/api/stats?range={}", r.key), r.bucket_secs))
         div class="pair" {
-            div class="card" {
-                h2 { "Top models (7d)" }
-                table class="grid" {
-                    thead { tr { th { "Model" } th { "Requests" } th { "Tokens" } } }
-                    tbody { @for (name, reqs, toks) in &top_models {
-                        tr { td { (name) } td { (reqs) } td { (toks) } }
-                    } }
-                }
-            }
-            div class="card" {
-                h2 { "Top keys (7d)" }
-                table class="grid" {
-                    thead { tr { th { "Key" } th { "Requests" } th { "Tokens" } } }
-                    tbody { @for (name, reqs, toks) in &top_keys {
-                        tr { td { (name) } td { (reqs) } td { (toks) } }
-                    } }
-                }
-            }
+            (breakdown_table("Top models", &top_models, None))
+            (breakdown_table("Top keys", &top_keys, Some("/admin/keys/")))
         }
-        link rel="stylesheet" href="/admin/assets/uplot.min.css";
-        script src="/admin/assets/uplot.iife.min.js" {}
-        script src="/admin/assets/dashboard.js" defer {}
     };
     Html(layout("Dashboard", "dashboard", body).into_string()).into_response()
+}
+
+/// One key's own statistics: the same charts, narrowed to it, plus what it
+/// spent per model.
+pub async fn key_stats_page(
+    State(st): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Query(q): Query<StatsQuery>,
+) -> Response {
+    let key = match crate::admin::pages::key_row(&st.db, id).await {
+        Ok(Some(k)) => k,
+        Ok(None) => return (axum::http::StatusCode::NOT_FOUND, "no such key").into_response(),
+        Err(e) => return err500(e),
+    };
+    let r = q.range();
+    let filter = usage::Filter {
+        key_id: Some(id),
+        model: None,
+    };
+    let totals = match usage::totals(&st.db, r, &filter).await {
+        Ok(t) => t,
+        Err(e) => return err500(e),
+    };
+    let per_model = usage::breakdown(&st.db, r, &filter, usage::By::Model, 0)
+        .await
+        .unwrap_or_default();
+    let all_time = usage::totals(&st.db, usage::range(Some("all")), &filter)
+        .await
+        .unwrap_or_default();
+
+    let body = html! {
+        div class="row page-head" {
+            h2 { (key.name) }
+            span class="badge mono" { "igx_" (key.key_prefix) "…" }
+            @if key.revoked_at.is_some() { span class="badge badge-danger" { "revoked" } }
+            @else { span class="badge badge-success" { "active" } }
+            a class="btn btn-sm" href=(format!("/admin/logs?key={id}")) { "Requests" }
+            a class="btn btn-sm" href="/admin/keys" { "All keys" }
+        }
+        p class="hint" {
+            "Created " (crate::admin::pages::fmt_ts(key.created_at)) " · "
+            @if let Some(e) = key.expires_at { "expires " (crate::admin::pages::fmt_ts(e)) }
+            @else { "never expires" }
+            " · all time: " (usage::fmt_count(all_time.total_tokens())) " tokens over "
+            (usage::fmt_count(all_time.requests)) " requests"
+        }
+        (range_picker(&format!("/admin/keys/{id}"), r))
+        (measures(&totals, None))
+        (charts(&format!("/admin/api/stats?range={}&key_id={id}", r.key), r.bucket_secs))
+        (breakdown_table("Per model", &per_model, None))
+    };
+    Html(layout(&format!("Key · {}", key.name), "keys", body).into_string()).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +250,12 @@ pub async fn dashboard(State(st): State<AppState>) -> Response {
 
 pub async fn settings_page(State(st): State<AppState>) -> Response {
     let retention_days = get_setting(&st.db, "retention_max_age_secs")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|s| s / 86_400);
+    let retention_usage_days = get_setting(&st.db, "retention_usage_max_age_secs")
         .await
         .ok()
         .flatten()
@@ -229,6 +313,13 @@ pub async fn settings_page(State(st): State<AppState>) -> Response {
                 label { "Keep database under (GB, empty = unlimited)" }
                 input type="number" step="0.1" name="max_db_gb" min="0.1"
                     value=(retention_gb.map(|g| format!("{g:.1}")).unwrap_or_default());
+                label { "Delete usage statistics older than (days, empty = keep forever)" }
+                input type="number" name="usage_max_age_days" min="1"
+                    value=(retention_usage_days.map(|d| d.to_string()).unwrap_or_default());
+                p class="hint" {
+                    "Statistics are the hourly rollup behind the dashboard and the key pages — "
+                    "a few dozen bytes per key, model and hour. Keeping them long outlives the "
+                    "payload retention above and costs almost nothing." }
                 button type="submit" class="primary" { "Save retention" }
             }
         }
@@ -300,11 +391,19 @@ pub async fn settings_page(State(st): State<AppState>) -> Response {
 pub struct RetentionForm {
     max_age_days: Option<String>,
     max_db_gb: Option<String>,
+    usage_max_age_days: Option<String>,
 }
 
 pub async fn save_retention(State(st): State<AppState>, Form(f): Form<RetentionForm>) -> Response {
     let age = f
         .max_age_days
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .parse::<i64>()
+        .ok();
+    let usage_age = f
+        .usage_max_age_days
         .as_deref()
         .unwrap_or("")
         .trim()
@@ -323,6 +422,17 @@ pub async fn save_retention(State(st): State<AppState>, Form(f): Form<RetentionF
                 set_setting(&st.db, "retention_max_age_secs", &(d * 86_400).to_string()).await?
             }
             _ => clear_setting(&st.db, "retention_max_age_secs").await?,
+        }
+        match usage_age {
+            Some(d) if d > 0 => {
+                set_setting(
+                    &st.db,
+                    "retention_usage_max_age_secs",
+                    &(d * 86_400).to_string(),
+                )
+                .await?
+            }
+            _ => clear_setting(&st.db, "retention_usage_max_age_secs").await?,
         }
         match gb {
             Some(g) if g > 0.0 => {

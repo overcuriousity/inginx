@@ -98,15 +98,28 @@ pub fn spawn_writer(db: Db) -> LogWriter {
     LogWriter(tx)
 }
 
-/// Deletes rows older than `max_age_secs`, then oldest-first until the DB fits
-/// `max_db_bytes`. Returns rows deleted.
-pub async fn prune(db: &Db, max_age_secs: Option<i64>, max_db_bytes: Option<i64>) -> Result<u64> {
+/// Deletes request rows older than `max_age_secs`, then oldest-first until the
+/// DB fits `max_db_bytes`. Returns rows deleted.
+///
+/// The hourly usage rollup has its own, separate age limit. It used to share
+/// the request cutoff, which meant a week of body retention also threw away
+/// every statistic older than a week — and the rollup is a few dozen bytes an
+/// hour, so there is no reason for it to go when the payloads do.
+/// `usage_max_age_secs` of `None` keeps it forever.
+pub async fn prune(
+    db: &Db,
+    max_age_secs: Option<i64>,
+    max_db_bytes: Option<i64>,
+    usage_max_age_secs: Option<i64>,
+) -> Result<u64> {
     db.call(move |c| {
         let mut deleted = 0u64;
         if let Some(age) = max_age_secs {
             let cutoff = now() - age;
             deleted += c.execute("DELETE FROM requests WHERE ts < ?1", [cutoff])? as u64;
-            c.execute("DELETE FROM usage_hourly WHERE hour < ?1", [cutoff])?;
+        }
+        if let Some(age) = usage_max_age_secs {
+            c.execute("DELETE FROM usage_hourly WHERE hour < ?1", [now() - age])?;
         }
         if let Some(max_bytes) = max_db_bytes {
             loop {
@@ -189,8 +202,13 @@ pub fn spawn_pruner(db: Db) {
                 .ok()
                 .flatten()
                 .and_then(|v| v.parse::<i64>().ok());
-            if max_age.is_some() || max_bytes.is_some() {
-                match prune(&db, max_age, max_bytes).await {
+            let usage_max_age = get_setting(&db, "retention_usage_max_age_secs")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<i64>().ok());
+            if max_age.is_some() || max_bytes.is_some() || usage_max_age.is_some() {
+                match prune(&db, max_age, max_bytes, usage_max_age).await {
                     Ok(n) if n > 0 => tracing::info!("retention pruned {n} request records"),
                     Ok(_) => {}
                     Err(e) => tracing::error!("retention pruning failed: {e}"),
@@ -261,6 +279,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn statistics_outlive_pruned_payloads() {
+        let db = testdb().await;
+        let old = now() - 30 * 86_400;
+        db.call(move |c| insert_record(c, &rec(old))).await.unwrap();
+        db.call(|c| insert_record(c, &rec(now()))).await.unwrap();
+
+        // A week of payload retention, no limit on the rollup.
+        prune(&db, Some(7 * 86_400), None, None).await.unwrap();
+        assert_eq!(count(&db).await, 1, "the old payload is gone");
+        let hours: i64 = db
+            .call(|c| Ok(c.query_row("SELECT count(*) FROM usage_hourly", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(hours, 2, "both hours of statistics survive");
+
+        // Given its own limit, the rollup is pruned too.
+        prune(&db, None, None, Some(7 * 86_400)).await.unwrap();
+        let hours: i64 = db
+            .call(|c| Ok(c.query_row("SELECT count(*) FROM usage_hourly", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(hours, 1);
+    }
+
+    #[tokio::test]
     async fn write_rollup_and_roundtrip() {
         let db = testdb().await;
         let w = spawn_writer(db.clone());
@@ -301,7 +344,7 @@ mod tests {
         }
         let fresh = rec(now());
         db.call(move |c| insert_record(c, &fresh)).await.unwrap();
-        let n = prune(&db, Some(86_400), None).await.unwrap();
+        let n = prune(&db, Some(86_400), None, None).await.unwrap();
         assert_eq!(n, 3);
         assert_eq!(count(&db).await, 1);
     }

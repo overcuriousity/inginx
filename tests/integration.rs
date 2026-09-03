@@ -778,3 +778,34 @@ async fn stalled_stream_is_abandoned_and_logged() {
         "the abandoned stream must say why"
     );
 }
+
+#[tokio::test]
+async fn usage_is_attributed_to_the_key_and_model() {
+    let ctx = setup().await;
+    for _ in 0..2 {
+        reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", ctx.inginx))
+            .bearer_auth(&ctx.key)
+            .json(&serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+    }
+    wait_for_rows(&ctx.db, 2).await;
+    let (key_id, model, reqs, prompt, completion): (i64, String, i64, i64, i64) = ctx
+        .db
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT key_id, model, SUM(n_requests), SUM(prompt_tokens),
+                        SUM(completion_tokens)
+                 FROM usage_hourly GROUP BY key_id, model",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(key_id > 0);
+    assert_eq!(model, "m");
+    assert_eq!((reqs, prompt, completion), (2, 6, 4));
+}

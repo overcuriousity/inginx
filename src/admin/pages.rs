@@ -213,32 +213,84 @@ pub struct KeyRow {
     pub expires_at: Option<i64>,
     pub n_requests: i64,
     pub n_models: i64,
+    /// All-time tokens, filled from the hourly rollup by `key_rows`.
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+}
+
+impl KeyRow {
+    pub fn total_tokens(&self) -> i64 {
+        self.prompt_tokens + self.completion_tokens
+    }
+}
+
+const KEY_COLS: &str = "k.id, k.name, k.key_prefix, k.all_models, k.created_at, k.revoked_at,
+     k.expires_at, (SELECT COUNT(*) FROM key_models km WHERE km.key_id = k.id)";
+
+fn key_row_from(r: &rusqlite::Row) -> rusqlite::Result<KeyRow> {
+    Ok(KeyRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        key_prefix: r.get(2)?,
+        all_models: r.get::<_, i64>(3)? != 0,
+        created_at: r.get(4)?,
+        revoked_at: r.get(5)?,
+        expires_at: r.get(6)?,
+        n_models: r.get(7)?,
+        // Filled from the rollup afterwards; one query for every key rather
+        // than a correlated subquery per column per row.
+        n_requests: 0,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+    })
 }
 
 pub async fn key_rows(db: &Db) -> Result<Vec<KeyRow>> {
-    db.call(|c| {
-        let mut stmt = c.prepare(
-            "SELECT k.id, k.name, k.key_prefix, k.all_models, k.created_at, k.revoked_at, k.expires_at,
-                    COALESCE((SELECT SUM(n_requests) FROM usage_hourly u WHERE u.key_id = k.id), 0),
-                    (SELECT COUNT(*) FROM key_models km WHERE km.key_id = k.id)
-             FROM api_keys k ORDER BY k.created_at DESC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(KeyRow {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                key_prefix: r.get(2)?,
-                all_models: r.get::<_, i64>(3)? != 0,
-                created_at: r.get(4)?,
-                revoked_at: r.get(5)?,
-                expires_at: r.get(6)?,
-                n_requests: r.get(7)?,
-                n_models: r.get(8)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    })
-    .await
+    let mut rows: Vec<KeyRow> = db
+        .call(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {KEY_COLS} FROM api_keys k ORDER BY k.created_at DESC"
+            ))?;
+            let rows = stmt.query_map([], key_row_from)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    let usage = super::usage::totals_by_key(db).await?;
+    for row in &mut rows {
+        if let Some(t) = usage.get(&row.id) {
+            row.n_requests = t.requests;
+            row.prompt_tokens = t.prompt_tokens;
+            row.completion_tokens = t.completion_tokens;
+        }
+    }
+    Ok(rows)
+}
+
+/// One key by id, for its statistics page.
+pub async fn key_row(db: &Db, id: i64) -> Result<Option<KeyRow>> {
+    let row: Option<KeyRow> = db
+        .call(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {KEY_COLS} FROM api_keys k WHERE k.id = ?1"
+            ))?;
+            Ok(stmt
+                .query_row([id], key_row_from)
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })?)
+        })
+        .await?;
+    let Some(mut row) = row else {
+        return Ok(None);
+    };
+    if let Some(t) = super::usage::totals_by_key(db).await?.get(&row.id) {
+        row.n_requests = t.requests;
+        row.prompt_tokens = t.prompt_tokens;
+        row.completion_tokens = t.completion_tokens;
+    }
+    Ok(Some(row))
 }
 
 pub fn fmt_ts(ts: i64) -> String {
@@ -268,20 +320,28 @@ pub fn keys_area(rows: &[KeyRow], new_key: Option<&str>) -> Markup {
                 table class="grid" {
                     thead { tr {
                         th { "Name" } th { "Key" } th { "Models" } th { "Created" }
-                        th { "Expires" } th { "Requests" } th { "Status" } th {}
+                        th { "Expires" } th { "Requests" }
+                        th { "Prompt" } th { "Completion" } th { "Tokens" }
+                        th { "Status" } th {}
                     } }
                     tbody {
                         @if rows.is_empty() {
-                            tr { td colspan="8" class="muted" { "No API keys yet." } }
+                            tr { td colspan="11" class="muted" { "No API keys yet." } }
                         }
                         @for k in rows {
-                            tr {
+                            // The whole row opens that key's statistics; the
+                            // delegated handler in app.js leaves clicks on the
+                            // buttons alone.
+                            tr class="clickable" data-href=(format!("/admin/keys/{}", k.id)) {
                                 td { (k.name) }
                                 td class="mono" { "igx_" (k.key_prefix) "…" }
                                 td { @if k.all_models { "all" } @else { (k.n_models) } }
                                 td { (fmt_ts(k.created_at)) }
                                 td { @if let Some(e) = k.expires_at { (fmt_ts(e)) } @else { "—" } }
-                                td { (k.n_requests) }
+                                td { (super::usage::fmt_count(k.n_requests)) }
+                                td { (super::usage::fmt_count(k.prompt_tokens)) }
+                                td { (super::usage::fmt_count(k.completion_tokens)) }
+                                td { strong { (super::usage::fmt_count(k.total_tokens())) } }
                                 td {
                                     @if k.revoked_at.is_some() { span class="badge badge-danger" { "revoked" } }
                                     @else { span class="badge badge-success" { "active" } }
