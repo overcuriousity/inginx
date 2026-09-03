@@ -254,6 +254,31 @@ mod tests {
         assert_eq!(all, 1);
     }
 
+    /// Voice maps and upstream paths are set once and then forgotten, so they
+    /// sit behind a per-row disclosure instead of taking two wide columns from
+    /// every model.
+    #[tokio::test]
+    async fn rare_model_settings_are_collapsed() {
+        let (st, app, cookie) = logged_in().await;
+        let b = crate::registry::add_backend(&st.db, "b", "http://x", None, true)
+            .await
+            .unwrap();
+        crate::registry::add_model(&st.db, b, "kokoro", "kokoro-tts")
+            .await
+            .unwrap();
+
+        let (status, body) = get_page(&app, "/admin/backends", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("<th title=\"Rewrites"),
+            "voice map is no longer a column: {body}"
+        );
+        assert!(body.contains("<summary>Advanced</summary>"), "{body}");
+        // Still reachable and still the same endpoints.
+        assert!(body.contains("voice_map"), "{body}");
+        assert!(body.contains("upstream_path"), "{body}");
+    }
+
     #[tokio::test]
     async fn backends_page_and_import() {
         let (st, app, cookie) = logged_in().await;

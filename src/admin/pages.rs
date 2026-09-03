@@ -525,8 +525,7 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                     table class="grid" {
                         thead { tr {
                             th { "Alias (public)" } th { "Upstream name" }
-                            th title="Rewrites the `voice` field of /v1/audio/speech before forwarding" { "Voice map" }
-                            th title="Send this model's requests to a path of your choosing instead of the client's" { "Upstream path" }
+                            th title="Voice map and upstream path — set once, if ever" { "Advanced" }
                             th { "Status" } th {}
                         } }
                         tbody {
@@ -545,32 +544,50 @@ pub async fn backends_area(st: &AppState, notice: Option<String>) -> anyhow::Res
                                         }
                                     }
                                     td class="mono" { (m.upstream_name) }
-                                    // Backends name their voices their own way
-                                    // (Kokoro `af_alloy`, Piper by language),
-                                    // while OpenAI clients send `alloy`. One
-                                    // `from=to` list per model bridges that.
+                                    // Both of these are set once for the odd
+                                    // backend and then never touched again,
+                                    // so they cost two wide columns on every
+                                    // row to earn nothing. `<details>` folds
+                                    // them away without needing JavaScript;
+                                    // the dot marks a row that has one set, so
+                                    // a configured model is still visible
+                                    // while closed.
                                     td {
-                                        form class="cell-form" hx-post=(format!("/admin/models/{}/voices", m.id))
-                                            hx-target="#backends-area" hx-swap="outerHTML" {
-                                            input type="text" name="voice_map"
-                                                value=(crate::proxy::format_voice_map(m.voice_map.as_deref()))
-                                                class="alias-input voice-input" placeholder="alloy=af_alloy, nova=af_nova"
-                                                title="Comma-separated from=to pairs";
-                                            button type="submit" class="ghost btn-sm" { "Save" }
-                                        }
-                                    }
-                                    // For a backend that speaks the OpenAI
-                                    // body at a path of its own — whisper.cpp
-                                    // on /inference, a service behind
-                                    // /api/v2/chat.
-                                    td {
-                                        form class="cell-form" hx-post=(format!("/admin/models/{}/path", m.id))
-                                            hx-target="#backends-area" hx-swap="outerHTML" {
-                                            input type="text" name="upstream_path"
-                                                value=(m.upstream_path.clone().unwrap_or_default())
-                                                class="alias-input voice-input" placeholder="(default) /chat/completions"
-                                                title="Empty = the client's path without /v1. {model} and {path} are substituted.";
-                                            button type="submit" class="ghost btn-sm" { "Save" }
+                                        details class="advanced" {
+                                            summary {
+                                                "Advanced"
+                                                @if m.voice_map.is_some() || m.upstream_path.is_some() {
+                                                    span class="advanced-dot" title="configured" { "•" }
+                                                }
+                                            }
+                                            // Backends name their voices their
+                                            // own way (Kokoro `af_alloy`, Piper
+                                            // by language), while OpenAI
+                                            // clients send `alloy`. One
+                                            // `from=to` list per model bridges
+                                            // that.
+                                            label class="advanced-label" { "Voice map" }
+                                            form class="cell-form" hx-post=(format!("/admin/models/{}/voices", m.id))
+                                                hx-target="#backends-area" hx-swap="outerHTML" {
+                                                input type="text" name="voice_map"
+                                                    value=(crate::proxy::format_voice_map(m.voice_map.as_deref()))
+                                                    class="alias-input voice-input" placeholder="alloy=af_alloy, nova=af_nova"
+                                                    title="Comma-separated from=to pairs. Rewrites the `voice` field of /v1/audio/speech before forwarding.";
+                                                button type="submit" class="ghost btn-sm" { "Save" }
+                                            }
+                                            // For a backend that speaks the
+                                            // OpenAI body at a path of its own
+                                            // — whisper.cpp on /inference, a
+                                            // service behind /api/v2/chat.
+                                            label class="advanced-label" { "Upstream path" }
+                                            form class="cell-form" hx-post=(format!("/admin/models/{}/path", m.id))
+                                                hx-target="#backends-area" hx-swap="outerHTML" {
+                                                input type="text" name="upstream_path"
+                                                    value=(m.upstream_path.clone().unwrap_or_default())
+                                                    class="alias-input voice-input" placeholder="(default) /chat/completions"
+                                                    title="Empty = the client's path without /v1. {model} and {path} are substituted.";
+                                                button type="submit" class="ghost btn-sm" { "Save" }
+                                            }
                                         }
                                     }
                                     td {

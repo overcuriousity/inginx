@@ -474,6 +474,19 @@ form:has([data-all-models]:checked) .model-picker {
   opacity: 0.45; pointer-events: none;
 }
 
+/* Voice map and upstream path, folded into one cell. Native `<details>`, so
+   the row stays narrow and the fields still work with app.js missing. */
+.advanced > summary {
+  cursor: pointer; color: var(--color-fg-muted);
+  font-size: var(--text-sm); padding: 0.15rem 0; user-select: none;
+}
+.advanced > summary:hover { color: var(--color-fg-primary); }
+.advanced-dot { color: var(--color-accent); margin-left: 0.3rem; }
+.advanced-label {
+  display: block; margin-top: 0.5rem;
+  font-size: var(--text-xs); color: var(--color-fg-muted);
+}
+
 /* The range selector above the usage charts. Links, not buttons: a chosen
    range is a URL, and the page works with JavaScript off. */
 .range-picker { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-bottom: 1rem; }
