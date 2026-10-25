@@ -1,6 +1,6 @@
 [package]
 name = "inginx"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Single-binary OpenAI-compatible inference proxy with API key GUI, usage metering, and full request logging"
