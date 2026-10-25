@@ -1,5 +1,6 @@
 use crate::db::{now, Db};
 use crate::metering::Usage;
+use crate::toolcalls::{self, Extracted};
 use anyhow::Result;
 use tokio::sync::mpsc;
 
@@ -33,12 +34,16 @@ impl LogWriter {
     }
 }
 
-fn compress(data: &[u8]) -> Vec<u8> {
+pub(crate) fn compress(data: &[u8]) -> Vec<u8> {
     zstd::encode_all(data, 3).unwrap_or_else(|_| data.to_vec())
 }
 
-fn insert_record(c: &mut rusqlite::Connection, rec: &LogRecord) -> Result<()> {
-    let tx = c.transaction()?;
+pub(crate) fn insert_record(
+    c: &mut rusqlite::Connection,
+    rec: &LogRecord,
+    tools: &Extracted,
+) -> Result<()> {
+    let mut tx = c.transaction()?;
     tx.execute(
         "INSERT INTO requests (id, ts, key_id, model, endpoint, status, latency_ms, ttfb_ms,
             prompt_tokens, completion_tokens, usage_source, error, req_headers, resp_headers,
@@ -81,6 +86,18 @@ fn insert_record(c: &mut rusqlite::Connection, rec: &LogRecord) -> Result<()> {
             (rec.status >= 400) as i64,
         ],
     )?;
+    // Under a savepoint so a tool-call failure rolls back only itself: the
+    // request row and its usage are the record, tool calls are a reading of it.
+    {
+        let mut sp = tx.savepoint()?;
+        match toolcalls::store(&sp, rec, tools) {
+            Ok(()) => sp.commit()?,
+            Err(e) => {
+                tracing::warn!("tool-call extraction for {} skipped: {e}", rec.id);
+                sp.rollback()?;
+            }
+        }
+    }
     tx.commit()?;
     Ok(())
 }
@@ -89,7 +106,10 @@ pub fn spawn_writer(db: Db) -> LogWriter {
     let (tx, mut rx) = mpsc::channel::<LogRecord>(1024);
     tokio::spawn(async move {
         while let Some(rec) = rx.recv().await {
-            let res = db.call(move |c| insert_record(c, &rec)).await;
+            // Parsed before taking the connection: the writer shares it with key
+            // auth on the hot path, and parsing a large body is the slow part.
+            let tools = toolcalls::extract(&rec);
+            let res = db.call(move |c| insert_record(c, &rec, &tools)).await;
             if let Err(e) = res {
                 tracing::error!("failed to write log record: {e}");
             }
@@ -248,6 +268,7 @@ pub async fn get_bodies(db: &Db, id: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>>
 mod tests {
     use super::*;
     use crate::keys::testdb;
+    use serde_json::json;
 
     fn rec(ts: i64) -> LogRecord {
         LogRecord {
@@ -278,12 +299,333 @@ mod tests {
             .unwrap()
     }
 
+    /// A chat-completions record whose bodies are the given JSON.
+    pub(crate) fn chat_rec(
+        id: &str,
+        ts: i64,
+        key: i64,
+        status: u16,
+        req: serde_json::Value,
+        resp: serde_json::Value,
+    ) -> LogRecord {
+        LogRecord {
+            id: id.into(),
+            key_id: Some(key),
+            endpoint: "/v1/chat/completions".into(),
+            status,
+            req_body: req.to_string().into_bytes(),
+            resp_body: resp.to_string().into_bytes(),
+            ..rec(ts)
+        }
+    }
+
+    pub(crate) async fn log(db: &Db, r: LogRecord) {
+        let x = toolcalls::extract(&r);
+        db.call(move |c| insert_record(c, &r, &x)).await.unwrap();
+    }
+
+    fn emits(calls: &[(&str, &str)]) -> serde_json::Value {
+        let tcs: Vec<_> = calls
+            .iter()
+            .map(|(id, t)| json!({"id": id, "type": "function", "function": {"name": t, "arguments": "{}"}}))
+            .collect();
+        json!({"choices": [{"message": {"tool_calls": tcs}}]})
+    }
+
+    /// A request carrying the assistant turn that issued `calls` and one tool
+    /// message per `(id, content)`.
+    fn answers(calls: &[(&str, &str)], results: &[(&str, &str)]) -> serde_json::Value {
+        let mut messages = vec![json!({"role": "user", "content": "go"})];
+        messages.push(emits(calls)["choices"][0]["message"].clone());
+        messages[1]["role"] = json!("assistant");
+        for (id, content) in results {
+            messages.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
+        }
+        json!({"messages": messages})
+    }
+
+    /// (request_id, result, result_request_id, result_status) per stored call.
+    async fn stored(db: &Db) -> Vec<(String, Option<String>, Option<String>, Option<u16>)> {
+        db.call(|c| {
+            let mut st = c.prepare(
+                "SELECT request_id, result, result_request_id, result_status
+                 FROM tool_calls ORDER BY ts, request_id",
+            )?;
+            let rows = st
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<Vec<u8>>>(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows
+                .into_iter()
+                .map(|(id, res, rid, rs)| {
+                    let res =
+                        res.map(|b| String::from_utf8(zstd::decode_all(&b[..]).unwrap()).unwrap());
+                    (id, res, rid, rs)
+                })
+                .collect())
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn scalar(db: &Db, sql: &'static str) -> i64 {
+        db.call(move |c| Ok(c.query_row(sql, [], |r| r.get(0))?))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_then_result_is_matched() {
+        let db = testdb().await;
+        let t = now();
+        log(
+            &db,
+            chat_rec(
+                "A",
+                t,
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("c1", "t")]),
+            ),
+        )
+        .await;
+        log(
+            &db,
+            chat_rec(
+                "B",
+                t + 1,
+                1,
+                200,
+                answers(&[("c1", "t")], &[("c1", "out")]),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            stored(&db).await,
+            vec![("A".into(), Some("out".into()), Some("B".into()), Some(200))]
+        );
+        assert_eq!(
+            scalar(&db, "SELECT SUM(n_calls) FROM tool_usage_hourly").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn resent_history_does_not_overwrite() {
+        let db = testdb().await;
+        let t = now();
+        log(
+            &db,
+            chat_rec(
+                "A",
+                t,
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("c1", "t")]),
+            ),
+        )
+        .await;
+        log(
+            &db,
+            chat_rec(
+                "B",
+                t + 1,
+                1,
+                200,
+                answers(&[("c1", "t")], &[("c1", "out")]),
+                json!({}),
+            ),
+        )
+        .await;
+        log(
+            &db,
+            chat_rec(
+                "C",
+                t + 2,
+                1,
+                200,
+                answers(&[("c1", "t")], &[("c1", "changed")]),
+                json!({}),
+            ),
+        )
+        .await;
+        let s = stored(&db).await;
+        assert_eq!(s[0].1.as_deref(), Some("out"));
+        assert_eq!(s[0].2.as_deref(), Some("B"));
+    }
+
+    #[tokio::test]
+    async fn reused_ids_pick_newest_open_call() {
+        let db = testdb().await;
+        let t = now();
+        log(
+            &db,
+            chat_rec(
+                "A",
+                t,
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("call_0", "t")]),
+            ),
+        )
+        .await;
+        log(
+            &db,
+            chat_rec(
+                "B",
+                t + 1,
+                1,
+                200,
+                answers(&[("call_0", "t")], &[("call_0", "first")]),
+                emits(&[("call_0", "t")]),
+            ),
+        )
+        .await;
+        // C resends the old turn and answers the new call, both under `call_0`.
+        let mut c_req = answers(&[("call_0", "t")], &[("call_0", "first")]);
+        let msgs = c_req["messages"].as_array_mut().unwrap();
+        msgs.push(json!({"role": "assistant", "tool_calls": [{"id": "call_0", "function": {"name": "t", "arguments": "{}"}}]}));
+        msgs.push(json!({"role": "tool", "tool_call_id": "call_0", "content": "second"}));
+        log(&db, chat_rec("C", t + 2, 1, 200, c_req, json!({}))).await;
+        let s = stored(&db).await;
+        assert_eq!((s[0].0.as_str(), s[0].1.as_deref()), ("A", Some("first")));
+        assert_eq!((s[1].0.as_str(), s[1].1.as_deref()), ("B", Some("second")));
+    }
+
+    #[tokio::test]
+    async fn other_key_cannot_match() {
+        let db = testdb().await;
+        let t = now();
+        log(
+            &db,
+            chat_rec(
+                "A",
+                t,
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("c1", "t")]),
+            ),
+        )
+        .await;
+        log(
+            &db,
+            chat_rec(
+                "B",
+                t + 1,
+                2,
+                200,
+                answers(&[("c1", "t")], &[("c1", "out")]),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(stored(&db).await[0].1, None);
+    }
+
+    #[tokio::test]
+    async fn failed_request_result_recorded() {
+        let db = testdb().await;
+        let t = now();
+        log(
+            &db,
+            chat_rec(
+                "A",
+                t,
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("c1", "t")]),
+            ),
+        )
+        .await;
+        log(
+            &db,
+            chat_rec(
+                "B",
+                t + 1,
+                1,
+                400,
+                answers(&[("c1", "t")], &[("c1", "huge")]),
+                json!({"error": {}}),
+            ),
+        )
+        .await;
+        let s = stored(&db).await;
+        assert_eq!((s[0].1.as_deref(), s[0].3), (Some("huge"), Some(400)));
+    }
+
+    #[tokio::test]
+    async fn garbage_bodies_still_log() {
+        let db = testdb().await;
+        let mut r = chat_rec("A", now(), 1, 200, json!({}), json!({}));
+        r.req_body = b"not json".to_vec();
+        log(&db, r).await;
+        log(
+            &db,
+            chat_rec(
+                "B",
+                now(),
+                1,
+                200,
+                json!({"messages": 5}),
+                json!({"choices": 5}),
+            ),
+        )
+        .await;
+        assert_eq!(count(&db).await, 2);
+        assert_eq!(
+            scalar(&db, "SELECT SUM(n_requests) FROM usage_hourly").await,
+            2
+        );
+        assert_eq!(scalar(&db, "SELECT count(*) FROM tool_calls").await, 0);
+    }
+
+    #[tokio::test]
+    async fn store_failure_keeps_log_row() {
+        let db = testdb().await;
+        db.call(|c| Ok(c.execute_batch("DROP TABLE tool_calls")?))
+            .await
+            .unwrap();
+        log(
+            &db,
+            chat_rec(
+                "A",
+                now(),
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("c1", "t")]),
+            ),
+        )
+        .await;
+        assert_eq!(count(&db).await, 1);
+        assert_eq!(
+            scalar(&db, "SELECT SUM(n_requests) FROM usage_hourly").await,
+            1
+        );
+    }
+
     #[tokio::test]
     async fn statistics_outlive_pruned_payloads() {
         let db = testdb().await;
         let old = now() - 30 * 86_400;
-        db.call(move |c| insert_record(c, &rec(old))).await.unwrap();
-        db.call(|c| insert_record(c, &rec(now()))).await.unwrap();
+        db.call(move |c| insert_record(c, &rec(old), &Extracted::default()))
+            .await
+            .unwrap();
+        db.call(|c| insert_record(c, &rec(now()), &Extracted::default()))
+            .await
+            .unwrap();
 
         // A week of payload retention, no limit on the rollup.
         prune(&db, Some(7 * 86_400), None, None).await.unwrap();
@@ -340,10 +682,14 @@ mod tests {
         let db = testdb().await;
         for _ in 0..3 {
             let r = rec(now() - 100_000);
-            db.call(move |c| insert_record(c, &r)).await.unwrap();
+            db.call(move |c| insert_record(c, &r, &Extracted::default()))
+                .await
+                .unwrap();
         }
         let fresh = rec(now());
-        db.call(move |c| insert_record(c, &fresh)).await.unwrap();
+        db.call(move |c| insert_record(c, &fresh, &Extracted::default()))
+            .await
+            .unwrap();
         let n = prune(&db, Some(86_400), None, None).await.unwrap();
         assert_eq!(n, 3);
         assert_eq!(count(&db).await, 1);

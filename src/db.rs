@@ -49,6 +49,18 @@ CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
   full INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tool_calls (
+  request_id TEXT NOT NULL, call_id TEXT NOT NULL, ts INTEGER NOT NULL,
+  key_id INTEGER, model TEXT, tool TEXT NOT NULL,
+  arguments BLOB, result BLOB, result_ts INTEGER,
+  result_request_id TEXT, result_status INTEGER,
+  PRIMARY KEY (request_id, call_id));
+CREATE INDEX IF NOT EXISTS idx_tool_calls_match ON tool_calls(key_id, call_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_tool ON tool_calls(tool, ts);
+CREATE TABLE IF NOT EXISTS tool_usage_hourly (
+  key_id INTEGER NOT NULL, model TEXT NOT NULL, tool TEXT NOT NULL, hour INTEGER NOT NULL,
+  n_calls INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (key_id, model, tool, hour));
 "#;
 
 /// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` does
