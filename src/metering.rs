@@ -209,6 +209,18 @@ mod tests {
         assert_eq!(v["stream_options"]["include_usage"], true);
     }
 
+    /// A rewritten body must keep the client's key order: tool schemas are
+    /// rendered into the prompt as written, so a reorder changes what the
+    /// model sees. Needs serde_json's `preserve_order` feature.
+    #[test]
+    fn rewrite_keeps_key_order() {
+        let b = br#"{"stream":true,"model":"a","tools":[{"type":"function","function":{"parameters":{"properties":{"zeta":{},"alpha":{}}}}}]}"#;
+        let (out, _) = prepare_upstream_body(b, Some("b"));
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with(r#"{"stream":true,"model":"b","tools":"#));
+        assert!(out.find("zeta").unwrap() < out.find("alpha").unwrap());
+    }
+
     #[test]
     fn no_injection_when_client_asked() {
         let b = br#"{"model":"m","stream":true,"stream_options":{"include_usage":true}}"#;
