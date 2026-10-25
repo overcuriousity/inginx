@@ -1,6 +1,6 @@
 //! Tool calls and their results, read out of chat-completions traffic.
 
-use crate::logstore::LogRecord;
+use crate::logstore::{compress, LogRecord};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -159,6 +159,63 @@ pub fn results_from_request(req_body: &[u8]) -> Vec<ToolResult> {
             })
         })
         .collect()
+}
+
+/// Writes one request's calls and fills in the results it carries.
+///
+/// Each result goes to the newest still-open call with the same key, id and
+/// tool that an *earlier* request emitted — a request cannot answer its own
+/// response. Results are taken last message first: when a backend reuses ids
+/// (`call_0` every turn), the latest tool message belongs to the latest call,
+/// and the resent older ones then find their calls already answered.
+pub fn store(c: &rusqlite::Connection, rec: &LogRecord, x: &Extracted) -> anyhow::Result<()> {
+    let hour = rec.ts - rec.ts % 3600;
+    for call in &x.calls {
+        c.execute(
+            "INSERT OR IGNORE INTO tool_calls (request_id, call_id, ts, key_id, model, tool, arguments)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                rec.id,
+                call.call_id,
+                rec.ts,
+                rec.key_id,
+                rec.model,
+                call.tool,
+                compress(call.arguments.as_bytes()),
+            ],
+        )?;
+        c.execute(
+            "INSERT INTO tool_usage_hourly (key_id, model, tool, hour, n_calls)
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT(key_id, model, tool, hour) DO UPDATE SET n_calls = n_calls + 1",
+            rusqlite::params![
+                rec.key_id.unwrap_or(-1),
+                rec.model.as_deref().unwrap_or(""),
+                call.tool,
+                hour,
+            ],
+        )?;
+    }
+    for result in x.results.iter().rev() {
+        c.execute(
+            "UPDATE tool_calls SET result = ?1, result_ts = ?2, result_request_id = ?3, result_status = ?4
+             WHERE rowid = (
+               SELECT rowid FROM tool_calls
+               WHERE key_id IS ?5 AND call_id = ?6 AND tool = ?7 AND result IS NULL
+                 AND ts <= ?2 AND request_id != ?3
+               ORDER BY ts DESC, rowid DESC LIMIT 1)",
+            rusqlite::params![
+                compress(result.content.as_bytes()),
+                rec.ts,
+                rec.id,
+                rec.status,
+                rec.key_id,
+                result.call_id,
+                result.tool,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// What one logged request contributes. Only chat completions carry tool
