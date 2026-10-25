@@ -157,6 +157,14 @@ pub async fn prune(
                 if size <= max_bytes {
                     break;
                 }
+                // The same 200 requests' tool calls first, by primary-key
+                // prefix, rather than an orphan sweep over the whole table
+                // on every batch.
+                c.execute(
+                    "DELETE FROM tool_calls WHERE request_id IN
+                       (SELECT id FROM requests ORDER BY ts ASC LIMIT 200)",
+                    [],
+                )?;
                 let n = c.execute(
                     "DELETE FROM requests WHERE id IN
                        (SELECT id FROM requests ORDER BY ts ASC LIMIT 200)",
@@ -166,10 +174,6 @@ pub async fn prune(
                     break;
                 }
                 deleted += n as u64;
-                c.execute(
-                    "DELETE FROM tool_calls WHERE request_id NOT IN (SELECT id FROM requests)",
-                    [],
-                )?;
                 // reclaim pages so the size check sees progress
                 c.execute_batch("PRAGMA incremental_vacuum;")?;
             }
@@ -510,6 +514,63 @@ pub(crate) mod tests {
         let s = stored(&db).await;
         assert_eq!((s[0].0.as_str(), s[0].1.as_deref()), ("A", Some("first")));
         assert_eq!((s[1].0.as_str(), s[1].1.as_deref()), ("B", Some("second")));
+    }
+
+    #[tokio::test]
+    async fn dangling_call_does_not_absorb_resent_results() {
+        let db = testdb().await;
+        let t = now();
+        // A's call is never answered; B..D are another conversation on the
+        // same key, with the backend reusing `call_0` every turn.
+        log(
+            &db,
+            chat_rec(
+                "A",
+                t,
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("call_0", "t")]),
+            ),
+        )
+        .await;
+        log(
+            &db,
+            chat_rec(
+                "B",
+                t + 1,
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("call_0", "t")]),
+            ),
+        )
+        .await;
+        log(
+            &db,
+            chat_rec(
+                "C",
+                t + 2,
+                1,
+                200,
+                answers(&[("call_0", "t")], &[("call_0", "x")]),
+                emits(&[("call_0", "t")]),
+            ),
+        )
+        .await;
+        let mut d_req = answers(&[("call_0", "t")], &[("call_0", "x")]);
+        let msgs = d_req["messages"].as_array_mut().unwrap();
+        msgs.push(json!({"role": "assistant", "tool_calls": [{"id": "call_0", "function": {"name": "t", "arguments": "{}"}}]}));
+        msgs.push(json!({"role": "tool", "tool_call_id": "call_0", "content": "y"}));
+        log(&db, chat_rec("D", t + 3, 1, 200, d_req, json!({}))).await;
+        let s = stored(&db).await;
+        assert_eq!(
+            (s[0].0.as_str(), s[0].1.as_deref()),
+            ("A", None),
+            "dangling call stays open"
+        );
+        assert_eq!((s[1].0.as_str(), s[1].1.as_deref()), ("B", Some("x")));
+        assert_eq!((s[2].0.as_str(), s[2].1.as_deref()), ("C", Some("y")));
     }
 
     #[tokio::test]
