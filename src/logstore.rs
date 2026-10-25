@@ -275,7 +275,7 @@ pub async fn get_bodies(db: &Db, id: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::keys::testdb;
     use serde_json::json;
@@ -334,7 +334,7 @@ mod tests {
         db.call(move |c| insert_record(c, &r, &x)).await.unwrap();
     }
 
-    fn emits(calls: &[(&str, &str)]) -> serde_json::Value {
+    pub(crate) fn emits(calls: &[(&str, &str)]) -> serde_json::Value {
         let tcs: Vec<_> = calls
             .iter()
             .map(|(id, t)| json!({"id": id, "type": "function", "function": {"name": t, "arguments": "{}"}}))
@@ -344,7 +344,7 @@ mod tests {
 
     /// A request carrying the assistant turn that issued `calls` and one tool
     /// message per `(id, content)`.
-    fn answers(calls: &[(&str, &str)], results: &[(&str, &str)]) -> serde_json::Value {
+    pub(crate) fn answers(calls: &[(&str, &str)], results: &[(&str, &str)]) -> serde_json::Value {
         let mut messages = vec![json!({"role": "user", "content": "go"})];
         messages.push(emits(calls)["choices"][0]["message"].clone());
         messages[1]["role"] = json!("assistant");

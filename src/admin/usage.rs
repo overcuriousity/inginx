@@ -114,7 +114,7 @@ impl Filter {
     /// The `AND …` tail of a WHERE clause. `prefix` qualifies the columns for
     /// statements that join (`"u."`), and is empty for those that do not —
     /// only the column names take it, never the parameter names.
-    fn sql(&self, prefix: &str) -> String {
+    pub(crate) fn sql(&self, prefix: &str) -> String {
         let mut s = String::new();
         if self.key_id.is_some() {
             s.push_str(&format!(" AND {prefix}key_id = :key_id"));
@@ -127,7 +127,7 @@ impl Filter {
 
     /// The named parameters matching `sql()`. Owned and `Send`, because they
     /// are carried into the blocking database closure.
-    fn bind(&self, since: i64) -> Vec<(&'static str, Box<dyn rusqlite::ToSql + Send>)> {
+    pub(crate) fn bind(&self, since: i64) -> Vec<(&'static str, Box<dyn rusqlite::ToSql + Send>)> {
         let mut v: Vec<(&'static str, Box<dyn rusqlite::ToSql + Send>)> =
             vec![(":since", Box::new(since))];
         if let Some(k) = self.key_id {

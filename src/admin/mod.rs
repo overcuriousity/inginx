@@ -3,6 +3,7 @@ pub mod auth;
 pub mod dashboard;
 pub mod logs;
 pub mod pages;
+pub mod tools;
 pub mod usage;
 
 use crate::proxy::AppState;
