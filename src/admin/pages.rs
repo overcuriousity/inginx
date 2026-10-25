@@ -102,6 +102,7 @@ pub fn layout(title: &str, active: &str, body: Markup) -> Markup {
         ("/admin/keys", "API Keys", "keys"),
         ("/admin/backends", "Backends", "backends"),
         ("/admin/logs", "Logs", "logs"),
+        ("/admin/tools", "Tools", "tools"),
         ("/admin/settings", "Settings", "settings"),
     ];
     // Prose or a grid: Settings is forms and sentences and takes a reading
