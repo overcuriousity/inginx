@@ -36,6 +36,8 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/logs", get(logs::logs_page))
         .route("/admin/logs/{id}", get(logs::log_detail))
         .route("/admin/logs/{id}/download", get(logs::log_download))
+        .route("/admin/tools", get(tools::tools_page))
+        .route("/admin/tools/{name}", get(tools::tool_detail))
         .route("/admin", get(dashboard::dashboard))
         .route("/admin/api/stats", get(dashboard::stats_api))
         .route("/admin/settings", get(dashboard::settings_page))
@@ -133,6 +135,94 @@ mod tests {
         let status = r.status();
         let body = axum::body::to_bytes(r.into_body(), 1 << 22).await.unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn seed_tool_call(st: &AppState, id: &str, tool: &str, args: &str) {
+        use crate::logstore::tests::{chat_rec, log};
+        let resp = serde_json::json!({"choices": [{"message": {"tool_calls": [
+            {"id": id, "type": "function", "function": {"name": tool, "arguments": args}}
+        ]}}]});
+        log(
+            &st.db,
+            chat_rec(
+                id,
+                crate::db::now() - 5,
+                1,
+                200,
+                serde_json::json!({"messages": []}),
+                resp,
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tools_page_lists_tools() {
+        let (st, app, cookie) = logged_in().await;
+        seed_tool_call(&st, "c1", "get_weather", "{}").await;
+        let (status, body) = get_page(&app, "/admin/tools", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("get_weather"), "{body}");
+        assert!(body.contains("href=\"/admin/tools/get_weather"), "{body}");
+        assert!(body.contains("href=\"/admin/tools\""), "nav link: {body}");
+    }
+
+    #[tokio::test]
+    async fn tools_page_empty() {
+        let (_st, app, cookie) = logged_in().await;
+        let (status, body) = get_page(&app, "/admin/tools", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("No tool calls"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn tool_page_shows_raw_call() {
+        use crate::logstore::tests::{answers, chat_rec, log};
+        let (st, app, cookie) = logged_in().await;
+        seed_tool_call(&st, "c1", "get_weather", r#"{"city":"Bonn"}"#).await;
+        log(
+            &st.db,
+            chat_rec(
+                "ans",
+                crate::db::now(),
+                1,
+                200,
+                answers(&[("c1", "get_weather")], &[("c1", "sunny")]),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        let (status, body) = get_page(&app, "/admin/tools/get_weather", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Bonn"), "{body}");
+        assert!(body.contains("sunny"), "{body}");
+        assert!(body.contains("/admin/logs/c1"), "{body}");
+        assert!(body.contains("/admin/logs/ans"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn tool_page_no_result() {
+        let (st, app, cookie) = logged_in().await;
+        seed_tool_call(&st, "c1", "get_weather", "{}").await;
+        let (status, body) = get_page(&app, "/admin/tools/get_weather", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("no result"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn tool_page_odd_name() {
+        let (st, app, cookie) = logged_in().await;
+        let name = "mcp__fs/read file";
+        seed_tool_call(&st, "c1", name, r#"{"path":"x"}"#).await;
+        let (_, overview) = get_page(&app, "/admin/tools", &cookie).await;
+        let encoded = urlencoding::encode(name).into_owned();
+        assert!(
+            overview.contains(&format!("/admin/tools/{encoded}")),
+            "{overview}"
+        );
+        let (status, body) = get_page(&app, &format!("/admin/tools/{encoded}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("path"), "{body}");
     }
 
     #[tokio::test]

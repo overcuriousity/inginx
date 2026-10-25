@@ -21,6 +21,10 @@ the common single-operator case:
   verbatim (zstd-compressed) in SQLite, browsable in the GUI, with
   age/size-based retention and export as **native JSONL** or **OpenTelemetry
   GenAI (OTLP/JSON) JSONL**.
+- **Tool-call insights**: every structured tool call in chat completions is
+  recorded with its arguments and, once the client sends it back, its
+  result. The Tools page counts calls by tool, key and model, and lists each
+  tool's raw calls linked to the logged requests.
 - **Admin GUI** (dark, server-rendered, no Node anywhere) protected by an
   argon2 password plus optional **FIDO2/WebAuthn passkey 2FA**.
 
