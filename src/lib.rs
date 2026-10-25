@@ -8,3 +8,4 @@ pub mod metering;
 pub mod proxy;
 pub mod ratelimit;
 pub mod registry;
+pub mod toolcalls;
