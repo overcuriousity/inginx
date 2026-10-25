@@ -137,9 +137,15 @@ pub async fn prune(
         if let Some(age) = max_age_secs {
             let cutoff = now() - age;
             deleted += c.execute("DELETE FROM requests WHERE ts < ?1", [cutoff])? as u64;
+            // Tool calls carry payload (arguments, results) and go with it.
+            c.execute("DELETE FROM tool_calls WHERE ts < ?1", [cutoff])?;
         }
         if let Some(age) = usage_max_age_secs {
             c.execute("DELETE FROM usage_hourly WHERE hour < ?1", [now() - age])?;
+            c.execute(
+                "DELETE FROM tool_usage_hourly WHERE hour < ?1",
+                [now() - age],
+            )?;
         }
         if let Some(max_bytes) = max_db_bytes {
             loop {
@@ -160,6 +166,10 @@ pub async fn prune(
                     break;
                 }
                 deleted += n as u64;
+                c.execute(
+                    "DELETE FROM tool_calls WHERE request_id NOT IN (SELECT id FROM requests)",
+                    [],
+                )?;
                 // reclaim pages so the size check sees progress
                 c.execute_batch("PRAGMA incremental_vacuum;")?;
             }
@@ -614,6 +624,83 @@ mod tests {
             scalar(&db, "SELECT SUM(n_requests) FROM usage_hourly").await,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn age_prune_covers_tool_calls() {
+        let db = testdb().await;
+        let old = now() - 30 * 86_400;
+        log(
+            &db,
+            chat_rec(
+                "A",
+                old,
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("c1", "t")]),
+            ),
+        )
+        .await;
+        log(
+            &db,
+            chat_rec(
+                "B",
+                now(),
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("c2", "t")]),
+            ),
+        )
+        .await;
+        prune(&db, Some(7 * 86_400), None, None).await.unwrap();
+        assert_eq!(scalar(&db, "SELECT count(*) FROM tool_calls").await, 1);
+        assert_eq!(
+            scalar(&db, "SELECT count(*) FROM tool_usage_hourly").await,
+            2
+        );
+        prune(&db, None, None, Some(7 * 86_400)).await.unwrap();
+        assert_eq!(
+            scalar(&db, "SELECT count(*) FROM tool_usage_hourly").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn size_prune_drops_orphans() {
+        let db = testdb().await;
+        let t = now();
+        log(
+            &db,
+            chat_rec(
+                "A",
+                t,
+                1,
+                200,
+                json!({"messages": []}),
+                emits(&[("c1", "t")]),
+            ),
+        )
+        .await;
+        prune(&db, None, Some(1), None).await.unwrap();
+        assert_eq!(count(&db).await, 0);
+        assert_eq!(scalar(&db, "SELECT count(*) FROM tool_calls").await, 0);
+        // A late answer to the pruned call finds nothing and breaks nothing.
+        log(
+            &db,
+            chat_rec(
+                "B",
+                t + 1,
+                1,
+                200,
+                answers(&[("c1", "t")], &[("c1", "out")]),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(count(&db).await, 1);
+        assert_eq!(scalar(&db, "SELECT count(*) FROM tool_calls").await, 0);
     }
 
     #[tokio::test]
