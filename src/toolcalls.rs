@@ -79,9 +79,14 @@ pub fn calls_from_response(resp_body: &[u8], request_id: &str) -> Vec<Call> {
             }
         }
     };
-    let text = std::str::from_utf8(resp_body).unwrap_or("");
-    if text.trim_start().starts_with("data:") {
-        for line in text.lines() {
+    // A buffered body is one JSON document. Anything else is read as SSE,
+    // line by line: a stream may open with a `: keep-alive` comment or carry
+    // `event:` lines, and a capture cut short by a disconnect can end in the
+    // middle of a character — the complete events before it still count.
+    if let Ok(v) = serde_json::from_slice::<Value>(resp_body) {
+        visit(&v, "message");
+    } else {
+        for line in String::from_utf8_lossy(resp_body).lines() {
             let Some(payload) = line.strip_prefix("data:") else {
                 continue;
             };
@@ -89,8 +94,6 @@ pub fn calls_from_response(resp_body: &[u8], request_id: &str) -> Vec<Call> {
                 visit(&v, "delta");
             }
         }
-    } else if let Ok(v) = serde_json::from_slice::<Value>(resp_body) {
-        visit(&v, "message");
     }
 
     let mut seen = HashSet::new();
@@ -107,12 +110,14 @@ pub fn calls_from_response(resp_body: &[u8], request_id: &str) -> Vec<Call> {
         .collect()
 }
 
-/// Every tool result the client sent back in one request.
+/// The tool results that are new in one request.
 ///
-/// A result counts only when the same request also carries the assistant
-/// message that issued the call: that sibling names the tool, and its
-/// presence is what ties the result to a call this conversation made rather
-/// than to any call that happens to share an id.
+/// The client resends the whole conversation every turn, so only the tool
+/// messages after the last assistant message are new; every earlier one was
+/// already sent in a previous request and matching it again could only
+/// attach it to the wrong call. That last assistant message is the one that
+/// issued the calls, and it names the tool. A tool message whose id it did
+/// not issue is ignored.
 pub fn results_from_request(req_body: &[u8]) -> Vec<ToolResult> {
     let Ok(v) = serde_json::from_slice::<Value>(req_body) else {
         return Vec::new();
@@ -120,28 +125,29 @@ pub fn results_from_request(req_body: &[u8]) -> Vec<ToolResult> {
     let Some(messages) = v.get("messages").and_then(Value::as_array) else {
         return Vec::new();
     };
+    let Some(last) = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+    else {
+        return Vec::new();
+    };
     let mut issued: HashMap<&str, &str> = HashMap::new();
-    for m in messages {
-        if m.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        for tc in m
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let id = tc.get("id").and_then(Value::as_str);
-            let name = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str);
-            if let (Some(id), Some(name)) = (id, name) {
-                issued.insert(id, name);
-            }
+    for tc in messages[last]
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = tc.get("id").and_then(Value::as_str);
+        let name = tc
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str);
+        if let (Some(id), Some(name)) = (id, name) {
+            issued.insert(id, name);
         }
     }
-    messages
+    messages[last + 1..]
         .iter()
         .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
         .filter_map(|m| {
@@ -165,9 +171,7 @@ pub fn results_from_request(req_body: &[u8]) -> Vec<ToolResult> {
 ///
 /// Each result goes to the newest still-open call with the same key, id and
 /// tool that an *earlier* request emitted — a request cannot answer its own
-/// response. Results are taken last message first: when a backend reuses ids
-/// (`call_0` every turn), the latest tool message belongs to the latest call,
-/// and the resent older ones then find their calls already answered.
+/// response, which matters when a backend reuses ids (`call_0` every turn).
 pub fn store(c: &rusqlite::Connection, rec: &LogRecord, x: &Extracted) -> anyhow::Result<()> {
     let hour = rec.ts - rec.ts % 3600;
     for call in &x.calls {
@@ -196,7 +200,7 @@ pub fn store(c: &rusqlite::Connection, rec: &LogRecord, x: &Extracted) -> anyhow
             ],
         )?;
     }
-    for result in x.results.iter().rev() {
+    for result in &x.results {
         c.execute(
             "UPDATE tool_calls SET result = ?1, result_ts = ?2, result_request_id = ?3, result_status = ?4
              WHERE rowid = (
@@ -347,6 +351,42 @@ mod tests {
         assert!(calls_from_response(b"not json", "R").is_empty());
         let text_stream = sse(&[json!({"choices":[{"delta":{"content":"hi"}}]})]);
         assert!(calls_from_response(&text_stream, "R").is_empty());
+    }
+
+    #[test]
+    fn stream_survives_cut_and_comments() {
+        let mut body = b": keep-alive\n\n".to_vec();
+        body.extend(sse(&[delta(
+            0,
+            json!({"id":"a","function":{"name":"read","arguments":"{}"}}),
+        )]));
+        body.truncate(body.len() - "data: [DONE]\n\n".len());
+        // The capture ends mid-way through a multibyte character.
+        body.extend_from_slice("data: {\"choices\":[{\"delta\":{\"content\":\"ü".as_bytes());
+        body.pop();
+        assert_eq!(
+            calls_from_response(&body, "R"),
+            vec![call("a", "read", "{}")]
+        );
+    }
+
+    #[test]
+    fn only_trailing_tool_block_counts() {
+        let body = json!({"messages":[
+            {"role":"assistant","tool_calls":[{"id":"old","function":{"name":"t","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"old","content":"already sent"},
+            {"role":"assistant","tool_calls":[{"id":"new","function":{"name":"u","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"new","content":"fresh"}
+        ]})
+        .to_string();
+        assert_eq!(
+            results_from_request(body.as_bytes()),
+            vec![ToolResult {
+                call_id: "new".into(),
+                tool: "u".into(),
+                content: "fresh".into()
+            }]
+        );
     }
 
     #[test]

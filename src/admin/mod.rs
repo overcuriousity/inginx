@@ -212,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn tool_page_odd_name() {
         let (st, app, cookie) = logged_in().await;
-        let name = "mcp__fs/read file";
+        let name = "mcp__fs/read file ü+%";
         seed_tool_call(&st, "c1", name, r#"{"path":"x"}"#).await;
         let (_, overview) = get_page(&app, "/admin/tools", &cookie).await;
         let encoded = urlencoding::encode(name).into_owned();
@@ -222,7 +222,12 @@ mod tests {
         );
         let (status, body) = get_page(&app, &format!("/admin/tools/{encoded}"), &cookie).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("path"), "{body}");
+        assert!(!body.contains("No calls of this tool"), "{body}");
+        assert!(body.contains("&quot;x&quot;"), "{body}");
+        // And a tool with no calls does not show them, so the above is not
+        // passing on page chrome.
+        let (_, other) = get_page(&app, "/admin/tools/nope", &cookie).await;
+        assert!(!other.contains("&quot;x&quot;"), "{other}");
     }
 
     #[tokio::test]
