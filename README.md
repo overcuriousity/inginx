@@ -5,7 +5,9 @@ A single-binary, OpenAI-compatible inference proxy for self-hosted AI backends
 the common single-operator case:
 
 - **100% OpenAI-compatible API** toward clients — chat, completions,
-  embeddings, TTS, STT, images, plus Jina/Cohere-style `/v1/rerank`. Unknown
+  embeddings, TTS, STT, images, Jina/Cohere-style `/v1/rerank`, and
+  decision models via `/v1/decisions` (OpenAI Decisions format) and
+  `/v1/systemone` (System One format). Unknown
   `/v1/*` routes are transparently proxied to your default backend.
 - **API key management** in a web GUI: create, revoke, rotate, and scope to
   models — a key's model set stays editable after it was issued, so widening
