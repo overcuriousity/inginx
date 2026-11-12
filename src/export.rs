@@ -230,7 +230,7 @@ mod tests {
 
     async fn seed(db: &Db, ts: i64, model: &str) {
         let rec = LogRecord {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             ts,
             key_id: Some(1),
             model: Some(model.into()),

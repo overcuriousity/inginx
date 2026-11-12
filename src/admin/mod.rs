@@ -441,7 +441,7 @@ mod tests {
         // seed two rows directly
         for (model, status) in [("m1", 200u16), ("m2", 500u16)] {
             let rec = crate::logstore::LogRecord {
-                id: ulid::Ulid::new().to_string(),
+                id: ulid::Ulid::generate().to_string(),
                 ts: crate::db::now(),
                 key_id: None,
                 model: Some(model.into()),
@@ -508,7 +508,7 @@ mod tests {
             .await
             .unwrap();
         st.log.send(crate::logstore::LogRecord {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             ts: crate::db::now(),
             key_id: None,
             model: Some("m".into()),

@@ -3,9 +3,7 @@ use crate::logstore::{get_setting, set_setting};
 use crate::proxy::AppState;
 use crate::ratelimit::{client_ip, PeerAddr};
 use anyhow::Result;
-use argon2::password_hash::{
-    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-};
+use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use axum::{
     extract::{Query, State},
@@ -16,7 +14,7 @@ use axum::{
     Form, Router,
 };
 use maud::{html, Markup, DOCTYPE};
-use rand::RngCore;
+use rand::Rng;
 use serde::Deserialize;
 
 const SESSION_COOKIE: &str = "inginx_session";
@@ -49,9 +47,9 @@ pub async fn ensure_setup_token(db: &Db) -> Result<Option<String>> {
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
+    // argon2 0.6 draws a fresh random salt from the OS RNG itself.
     Ok(Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .to_string())
 }
