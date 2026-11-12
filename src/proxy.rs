@@ -152,7 +152,7 @@ async fn require_api_key(State(st): State<AppState>, mut req: Request, next: Nex
 /// it is read, so an unauthenticated caller still cannot make us buffer one.
 fn log_auth_failure(st: &AppState, endpoint: String, req_headers: String, error: &str) {
     st.log.send(LogRecord {
-        id: ulid::Ulid::new().to_string(),
+        id: ulid::Ulid::generate().to_string(),
         ts: now(),
         key_id: None,
         model: None,
@@ -874,7 +874,7 @@ pub async fn proxy_handler(
     };
 
     st.log.send(LogRecord {
-        id: ulid::Ulid::new().to_string(),
+        id: ulid::Ulid::generate().to_string(),
         ts: now(),
         key_id: log_base.key_id,
         model: log_base.model.clone(),
@@ -937,7 +937,7 @@ pub(crate) struct LogBase {
 
 fn log_failure(st: &AppState, base: LogBase, status: u16, error: String) {
     st.log.send(LogRecord {
-        id: ulid::Ulid::new().to_string(),
+        id: ulid::Ulid::generate().to_string(),
         ts: now(),
         key_id: base.key_id,
         model: base.model,
@@ -1175,7 +1175,7 @@ impl StreamTee {
             ),
         };
         Some(LogRecord {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             ts: now(),
             key_id: base.key_id,
             model: base.model,

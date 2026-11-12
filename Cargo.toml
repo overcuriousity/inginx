@@ -11,25 +11,25 @@ anyhow = "1"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["stream", "json", "multipart"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
-maud = "0.26"
+rusqlite = { version = "0.42", features = ["bundled"] }
+maud = "0.27"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-toml = "0.8"
-ulid = "1"
+toml = "1"
+ulid = "3"
 sha2 = "0.11"
-rand = "0.9"
-zstd = "0.13"
-argon2 = { version = "0.5", features = ["std"] }
-webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+rand = "0.10"
+zstd = "0.14"
+argon2 = "0.6"
+webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 bytes = "1"
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 urlencoding = "2"
 
 [dev-dependencies]

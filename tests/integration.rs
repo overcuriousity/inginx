@@ -166,6 +166,28 @@ async fn spawn_mock_upstream() -> SocketAddr {
                 Json(serde_json::Value::Object(m))
             }),
         )
+        // Decision-model endpoints (OpenAI Decisions, System One): typed
+        // answers, usage reported as input tokens only.
+        .route(
+            "/decisions",
+            post(|Json(b): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "model": b["model"],
+                    "model_seen": b["model"],
+                    "answers": [{"type": "predicate", "probability": 0.93}],
+                    "usage": {"input_tokens": 11}
+                }))
+            }),
+        )
+        .route(
+            "/systemone",
+            post(|Json(b): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "model_seen": b.get("model"),
+                    "answers": {"is_spam": {"probability": 0.02}}
+                }))
+            }),
+        )
         .route(
             "/models",
             get(|| async { Json(serde_json::json!({"data":[{"id":"m-upstream"}]})) }),
@@ -947,4 +969,109 @@ async fn a_model_can_be_pointed_at_its_own_upstream_path() {
         .unwrap();
     assert_eq!(v["text"], "custom path");
     assert_eq!(v["model_rewritten"], true, "the alias is still translated");
+}
+
+/// OpenAI Decisions format: routed by `model` alias like any OpenAI body,
+/// metered from the upstream `usage.input_tokens`.
+#[tokio::test]
+async fn decisions_routed_by_model_and_metered() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/decisions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({
+            "model": "m",
+            "input": "The package arrived broken and support never answered.",
+            "questions": [{"type": "predicate", "question": "Is the customer unhappy?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["model_seen"], "m-upstream", "alias rewritten upstream");
+    assert_eq!(v["model"], "m", "response model mapped back to the alias");
+    assert_eq!(v["answers"][0]["probability"], 0.93);
+    wait_for_rows(&ctx.db, 1).await;
+    let (endpoint, model, pt, ct, src): (String, String, i64, i64, String) = ctx
+        .db
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT endpoint, model, prompt_tokens, completion_tokens, usage_source FROM requests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(endpoint, "/v1/decisions");
+    assert_eq!(model, "m");
+    assert_eq!((pt, ct), (11, 0));
+    assert_eq!(src, "upstream");
+}
+
+#[tokio::test]
+async fn decisions_respect_key_model_scope() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/decisions", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model": "ghost", "input": "x", "questions": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "model_not_found");
+}
+
+/// System One format: `model` is optional; without it the request goes to
+/// the default backend and usage is estimated from the body.
+#[tokio::test]
+async fn systemone_without_model_goes_to_default_backend() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/systemone", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({
+            "state": "WIN A FREE CRUISE!!! Click here now.",
+            "questions": {"is_spam": {"type": "predicate", "question": "Is this spam?"}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(v["model_seen"].is_null(), "no model injected");
+    assert_eq!(v["answers"]["is_spam"]["probability"], 0.02);
+    wait_for_rows(&ctx.db, 1).await;
+    let (endpoint, pt, src): (String, i64, String) = ctx
+        .db
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT endpoint, prompt_tokens, usage_source FROM requests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(endpoint, "/v1/systemone");
+    assert!(pt > 0, "prompt tokens estimated from the request body");
+    assert_eq!(src, "estimated");
+}
+
+#[tokio::test]
+async fn systemone_with_model_alias_is_rewritten() {
+    let ctx = setup().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/systemone", ctx.inginx))
+        .bearer_auth(&ctx.key)
+        .json(&serde_json::json!({"model": "m", "state": "hi", "questions": {}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["model_seen"], "m-upstream");
 }

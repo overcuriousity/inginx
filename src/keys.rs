@@ -1,6 +1,6 @@
 use crate::db::{now, Db};
 use anyhow::Result;
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]

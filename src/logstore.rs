@@ -286,7 +286,7 @@ pub(crate) mod tests {
 
     fn rec(ts: i64) -> LogRecord {
         LogRecord {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             ts,
             key_id: Some(1),
             model: Some("m".into()),

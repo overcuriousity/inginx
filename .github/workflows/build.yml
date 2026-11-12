@@ -25,7 +25,7 @@ jobs:
           cp target/release/inginx inginx-x86_64-linux
           sha256sum inginx-x86_64-linux > inginx-x86_64-linux.sha256
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: inginx-x86_64-linux
           path: |
